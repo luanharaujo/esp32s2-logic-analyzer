@@ -30,6 +30,7 @@
 #include "mdns.h"
 #include "driver/gpio.h"
 #include "mbedtls/sha256.h"
+#include "capture.h"
 
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
@@ -367,6 +368,8 @@ static void json_reply(httpd_req_t *req, const char *body) {
     httpd_resp_sendstr(req, body);
 }
 
+static bool is_ota_busy(void) { return ota_busy; }
+
 static esp_err_t status_handler(httpd_req_t *req) {
     static char buf[1400];
     const esp_app_desc_t *app = esp_ota_get_app_description();
@@ -407,7 +410,12 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "GET  /scan            APs visiveis\n"
         "POST /ota             corpo = firmware .bin (header X-Token, opcional X-SHA256)\n"
         "POST /ota?url=URL     o ESP baixa o .bin (header X-Token)\n"
-        "POST /reboot          (header X-Token)\n");
+        "POST /reboot          (header X-Token)\n"
+        "GET  /channels        mapa dos 8 canais\n"
+        "GET  /levels[?pull=]  nivel atual dos canais\n"
+        "GET  /capture?ms=100&trigger=IO10&edge=fall&timeout_ms=10000&pull=up&pins=IO10,IO11\n"
+        "                      CSV de bordas (formato gpio_edges v1, ciclos de 240 MHz)\n"
+        "POST /gen?pin=IO10&hz=1000&duty=50   gerador de teste no canal (hz=0 desliga; X-Token)\n");
     return ESP_OK;
 }
 
@@ -578,7 +586,7 @@ static void start_http(void) {
     httpd_handle_t server = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 12;
+    cfg.max_uri_handlers = 16;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 10;
     if (httpd_start(&server, &cfg) != ESP_OK) {
@@ -594,6 +602,7 @@ static void start_http(void) {
         { .uri = "/reboot", .method = HTTP_POST, .handler = reboot_handler },
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) httpd_register_uri_handler(server, &uris[i]);
+    capture_register(server);
     http_started = true;
     ESP_LOGI(TAG, "HTTP em :80");
 }
@@ -654,6 +663,7 @@ void app_main(void) {
              (unsigned long)rtc_diag.boot_count, reset_reason_str(), prev_diag_valid ? prev_diag.detail : "",
              prev_diag_valid ? (unsigned long)prev_diag.last_uptime_s : 0UL);
     ota_rollback_check_boot();
+    capture_init(is_ota_busy, token_ok);
     xTaskCreate(supervisor_task, "supervisor", 3072, NULL, 10, NULL);
 
     esp_err_t r = nvs_flash_init();

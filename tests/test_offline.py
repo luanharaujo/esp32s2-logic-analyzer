@@ -1,0 +1,128 @@
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["mcp>=1.2,<2"]
+# ///
+"""Testes sem hardware: um ESP falso (HTTP local) responde como o firmware; confere CLI, análise e OTA.
+Uso: uv run tests/test_offline.py"""
+import hashlib, json, subprocess, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "agent"))
+import analyzer  # noqa: E402
+
+HZ = 240_000_000
+TOKEN = analyzer.TOKEN_FILE.read_text().strip()
+state = {"boot": 1, "fw": "0.2.0", "t0": time.time(), "gen": None}
+
+
+def fake_csv(q: dict) -> str:
+    ms = int(q.get("ms", ["100"])[0])
+    trig = q.get("trigger", ["none"])[0]
+    lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=up trigger={trig} edge=fall pins=IO10,IO11",
+             "# initial IO10=1 IO11=0", "cycles,pin,level"]
+    t, lv = 0, 0  # bounce no IO10: 6 transições em ~300 µs, depois estável
+    for w_us in [0, 2.5, 10, 40, 120, 130]:
+        t += int(w_us * HZ / 1e6)
+        lines.append(f"{t},IO10,{lv}")
+        lv ^= 1
+    if state["gen"]:  # onda de 1 kHz, 50% no IO11
+        for k in range(2 * ms):
+            lines.append(f"{k * HZ // 2000 + 7},IO11,{(k + 1) % 2}")
+    n = len(lines) - 3
+    lines.append(f"# end edges={n} overflow=0 max_gap_cycles=24 status=ok loops={ms * 10000} max_edges=20000 wait_ms=812 err=")
+    return "\n".join(lines) + "\n"
+
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, code, body, ctype="application/json"):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(b)
+
+    def do_GET(self):
+        u = urlparse(self.path); q = parse_qs(u.query)
+        if u.path == "/status":
+            self.reply(200, json.dumps({"ok": True, "fw": state["fw"], "boot": state["boot"], "partition": "ota_1",
+                                        "uptime_s": int(time.time() - state["t0"]), "reset_detail": "",
+                                        "ota_pending_verify": False}))
+        elif u.path == "/capture":
+            self.reply(200, fake_csv(q), "text/csv")
+        elif u.path == "/levels":
+            self.reply(200, json.dumps({"ok": True, "raw": 1, "ch": {c: int(i == 0) for i, c in enumerate(analyzer.CHANNELS)}}))
+        elif u.path == "/channels":
+            self.reply(200, json.dumps({"ok": True, "channels": [{"name": c} for c in analyzer.CHANNELS]}))
+        else:
+            self.reply(404, "{}")
+
+    def do_POST(self):
+        u = urlparse(self.path); q = parse_qs(u.query)
+        if self.headers.get("X-Token") != TOKEN:
+            return self.reply(403, '{"ok":false,"err":"token"}')
+        n = int(self.headers.get("Content-Length", 0)); d = self.rfile.read(n)
+        if u.path == "/gen":
+            state["gen"] = int(q["hz"][0]) > 0
+            self.reply(200, json.dumps({"ok": True, "gen": q["pin"][0]}))
+        elif u.path == "/ota":
+            if hashlib.sha256(d).hexdigest() != self.headers.get("X-SHA256"):
+                return self.reply(400, "sha")
+            self.reply(200, '{"ok":true}')
+            state.update(boot=state["boot"] + 1, fw="0.2.1", t0=time.time())
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+host = f"127.0.0.1:{srv.server_address[1]}"
+an = analyzer.Analyzer(host)
+fails = 0
+
+
+def check(name, cond, extra=""):
+    global fails
+    print(("ok   " if cond else "FAIL ") + name + (f"  {extra}" if extra and not cond else ""))
+    fails += not cond
+
+
+st = an.status(); check("status", st["fw"] == "0.2.0")
+check("levels", an.levels("up")["ch"]["IO10"] == 1)
+check("gen", an.gen("IO11", 1000)["ok"])
+res = an.capture(ms=100, trigger="IO10", edge="fall", pull="up", tag="teste")
+io10 = res["pins"]["IO10"]
+check("bounce: 1 evento", len(io10["events"]) == 1, io10)
+ev = io10["events"][0]
+check("bounce: 6 transições", ev["transitions"] == 6, ev)
+check("bounce: duração 302,5 µs", abs(ev["bounce_us"] - 302.5) < 0.01, ev)
+check("bounce: menor pulso 2,5 µs", abs(ev["min_pulse_us"] - 2.5) < 0.01, ev)
+io11 = res["pins"]["IO11"]
+check("gerador: 1 kHz", abs(io11.get("freq_hz", 0) - 1000) < 1, io11)
+check("gerador: duty 50%", abs(io11.get("duty_pct", 0) - 50) < 1, io11)
+check("período médio de amostra", res.get("mean_sample_period_us") == 0.1, res.get("mean_sample_period_us"))
+csv_path = Path(res["csv_local"])
+check("CSV salvo", csv_path.exists())
+off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(csv_path)],
+                                capture_output=True, text=True).stdout)
+check("analyze offline igual", off["pins"]["IO10"]["events"][0]["transitions"] == 6)
+csv_path.unlink()
+binp = ROOT / "firmware/build/s2la.bin"
+if binp.exists():
+    r = an.ota(str(binp), expect="0.2.1")
+    check("ota", r["ok"] and r["after_fw"] == "0.2.1", r)
+# MCP: lista de ferramentas
+p = subprocess.Popen(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "mcp"], stdin=subprocess.PIPE,
+                     stdout=subprocess.PIPE, text=True)
+msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+         "clientInfo": {"name": "t", "version": "0"}}},
+        {"jsonrpc": "2.0", "method": "notifications/initialized"},
+        {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+for m in msgs:
+    p.stdin.write(json.dumps(m) + "\n"); p.stdin.flush()
+p.stdout.readline()
+tools = [t["name"] for t in json.loads(p.stdout.readline())["result"]["tools"]]
+p.kill()
+check("MCP tools", set(tools) >= {"status", "capture", "levels", "channels", "test_generator", "device_log"}, tools)
+print("FALHAS:", fails)
+sys.exit(1 if fails else 0)
