@@ -1,0 +1,9 @@
+firmware/build/
+firmware/sdkconfig.old
+firmware/main/wifi_secrets.h
+backup/
+captures/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
