@@ -74,7 +74,7 @@ static inline uint32_t IRAM_ATTR read_in(void) { return cpu_ll_read_dedic_gpio_i
 
 // O laço quente. Chamado com interrupções mascaradas. start: ciclo do t=0. first_in >= 0: grava esse
 // valor como a primeira borda em t=0 (a borda do trigger detectada pelo laço de espera).
-static void IRAM_ATTR capture_loop(uint32_t last, uint32_t start, int first_in) {
+static void IRAM_ATTR __attribute__((noinline)) capture_loop(uint32_t last, uint32_t start, int first_in) {
     uint32_t *t = cap.t;
     uint8_t *v = cap.v;
     uint32_t n = 0, max_edges = cap.max_edges, win = cap.win_cycles, max_gap = 0, loops = 0;
@@ -111,7 +111,7 @@ static void IRAM_ATTR capture_loop(uint32_t last, uint32_t start, int first_in) 
 // ciclos. Devolve 0 se não veio; 1 se veio (em *t_trig, com *in_trig = valor depois da borda e *plast =
 // valor antes); 2 se já veio na 1a leitura (a borda pode ter ocorrido na pausa entre fatias).
 enum { EDGE_ANY = 0, EDGE_RISE = 1, EDGE_FALL = 2 };
-static int IRAM_ATTR wait_trigger(uint32_t *plast, uint32_t bit, int edge, uint32_t slice, uint32_t *t_trig,
+static int IRAM_ATTR __attribute__((noinline)) wait_trigger(uint32_t *plast, uint32_t bit, int edge, uint32_t slice, uint32_t *t_trig,
                                   uint32_t *in_trig) {
     uint32_t last = *plast, t0 = XTHAL_GET_CCOUNT();
     bool first = true;
