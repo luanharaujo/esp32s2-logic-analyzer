@@ -620,11 +620,12 @@ static void start_mdns(void) {
 
 // ---------------------------------------------------------------------------------------
 // Supervisor: alimenta o Task Watchdog (panic em 10 s se travar), valida/rola de volta a
-// OTA e reinicia se ficar 15 min sem Wi-Fi depois de já ter conectado.
+// OTA e reinicia se ficar 15 min sem Wi-Fi depois de já ter conectado (ou 10 min sem nunca conectar).
 // ---------------------------------------------------------------------------------------
 #define OTA_VERIFY_DEADLINE_S 180
 #define OTA_VERIFY_STABLE_S   20
 #define WIFI_LOST_RESTART_US  (15LL * 60 * 1000000)
+#define WIFI_NEVER_RESTART_US (10LL * 60 * 1000000)
 
 static void supervisor_task(void *pv) {
     ESP_ERROR_CHECK(esp_task_wdt_add(NULL));
@@ -649,6 +650,12 @@ static void supervisor_task(void *pv) {
         }
         if (!wifi_has_ip && wifi_lost_since_us && now - wifi_lost_since_us > WIFI_LOST_RESTART_US && !ota_busy) {
             restart_with("wifi_lost_15min");
+        }
+        if (!wifi_connects && now > WIFI_NEVER_RESTART_US && strlen(WIFI_SSID) > 0) {
+            restart_with("wifi_never_10min");
+        }
+        if ((now / 1000000) % 60 == 0) {
+            ESP_LOGI(TAG, "vivo: uptime %lld s, ip '%s', heap %u", now / 1000000, wifi_ip, (unsigned)esp_get_free_heap_size());
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }

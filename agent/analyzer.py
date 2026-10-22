@@ -16,6 +16,8 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
                                      [--pins IO10,IO11] [--settle-us 5000]   # salva CSV em captures/ e resume
     uv run agent/analyzer.py analyze captures/x.csv [--settle-us 5000]       # offline
     uv run agent/analyzer.py gen IO10 --hz 1000 [--duty 50] | gen IO10 --hz 0  # gerador de teste no canal
+    uv run agent/analyzer.py gen IO10 --mode bounce [--delay-ms 500]          # rajada de bounce de teste
+    uv run agent/analyzer.py selftest                                          # autoteste sem nada ligado
     uv run agent/analyzer.py mcp                  # servidor MCP (stdio)
 Host: --host, ou S2LA_HOST, ou logic-s2.local. Token (rotas que alteram o ESP): ~/.config/s2la/token.
 """
@@ -124,15 +126,50 @@ class Analyzer:
     def levels(self, pull: str | None = None) -> dict:
         return json.loads(self.request("/levels" + (f"?pull={pull}" if pull else "")))
 
-    def gen(self, pin: str, hz: int, duty: int = 50) -> dict:
-        q = urllib.parse.urlencode({"pin": pin, "hz": hz, "duty": duty})
+    def gen(self, pin: str, hz: int = 0, duty: int = 50, mode: str = "square", delay_ms: int = 500) -> dict:
+        """Gerador de teste no próprio canal: mode="square" (LEDC, hz=0 desliga) ou "bounce" (rajada de
+        botão com bounce, por RMT com 1 µs exato, disparada delay_ms depois)."""
+        q = urllib.parse.urlencode({"pin": pin, "hz": hz, "duty": duty, "mode": mode, "delay_ms": delay_ms})
         return json.loads(self.request(f"/gen?{q}", method="POST", data=b"", auth=True))
 
+    def selftest(self) -> dict:
+        """Autoteste sem nada ligado aos canais: (1) rajada de bounce conhecida no IO10, capturada com
+        trigger na borda de descida; (2) onda de 10 kHz no IO11. Compara com o esperado."""
+        out = {"ok": True}
+        g = self.gen("IO10", mode="bounce", delay_ms=800)
+        expected = g["pattern_us"]
+        res = analyze(parse_edges_csv(self.capture_csv(ms=60, trigger="IO10", edge="fall", timeout_ms=3000,
+                                                       pins="IO10")), settle_us=5000)
+        evs = res["pins"]["IO10"]["events"]
+        got = [w for e in evs for w in e["pulses_us"]]
+        # larguras esperadas entre bordas: todas menos a última (repouso final); o trecho longo (20 ms)
+        # separa os dois eventos (pressão e soltura) e não aparece em pulses_us
+        want = [d for d in expected[:-1] if d < 5000]
+        err = max((abs(a - b) for a, b in zip(got, want)), default=None)
+        b_ok = len(got) == len(want) and err is not None and err < 0.5
+        out["bounce"] = {"ok": b_ok, "status": res["status"], "events": len(evs), "pulses_us": got, "expected_us": want,
+                         "max_err_us": err, "max_sample_gap_us": res.get("max_sample_gap_us"),
+                         "mean_sample_period_us": res.get("mean_sample_period_us")}
+        # mesma rajada com trigger por interrupção (informativo: mostra o que a latência da ISR perde)
+        self.gen("IO10", mode="bounce", delay_ms=800)
+        res = analyze(parse_edges_csv(self.capture_csv(ms=60, trigger="IO10", edge="fall", timeout_ms=3000,
+                                                       pins="IO10", tmode="isr")), settle_us=5000)
+        out["bounce_isr_info"] = {"status": res["status"],
+                                  "pulses_us": [w for e in res["pins"]["IO10"]["events"] for w in e["pulses_us"]]}
+        self.gen("IO11", hz=10000, duty=30)
+        res = analyze(parse_edges_csv(self.capture_csv(ms=20, pins="IO11")))
+        p = res["pins"]["IO11"]
+        sq_ok = abs(p.get("freq_hz", 0) - 10000) < 50 and abs(p.get("duty_pct", 0) - 30) < 3
+        out["square"] = {"ok": sq_ok, "freq_hz": p.get("freq_hz"), "duty_pct": p.get("duty_pct"), "edges": p["edges"]}
+        self.gen("IO11", hz=0)
+        out["ok"] = b_ok and sq_ok
+        return out
+
     def capture_csv(self, ms: int = 100, trigger: str | None = None, edge: str = "any", timeout_ms: int = 10000,
-                    pull: str = "none", pins: str | None = None) -> str:
+                    pull: str = "none", pins: str | None = None, tmode: str = "poll") -> str:
         """Captura bordas nos canais (CSV gpio_edges v1, ciclos de 240 MHz). Com trigger, espera a borda até
         timeout_ms e captura ms a partir dela."""
-        q = {"ms": ms, "edge": edge, "timeout_ms": timeout_ms, "pull": pull}
+        q = {"ms": ms, "edge": edge, "timeout_ms": timeout_ms, "pull": pull, "tmode": tmode}
         if trigger:
             q["trigger"] = trigger
         if pins:
@@ -289,21 +326,30 @@ def run_mcp():
 
     @mcp.tool()
     def capture(ms: int = 100, trigger: str = "", edge: str = "any", timeout_ms: int = 10000,
-                pull: str = "none", pins: str = "", settle_us: float = 5000.0) -> str:
+                pull: str = "none", pins: str = "", settle_us: float = 5000.0, tmode: str = "poll") -> str:
         """Captura bordas nos canais do analisador (resolução ~0,1 µs, janela de até 2000 ms).
         trigger: canal (ex. "IO10") cuja borda (edge: rise, fall, any) dispara a captura; vazio = agora.
         timeout_ms: quanto esperar pelo trigger. pull: up/down/none em todos os canais.
         pins: lista "IO10,IO11" (vazio = os 8). settle_us: silêncio que separa eventos (bounce).
+        tmode: "poll" (padrão, latência ~0,1 µs; Wi-Fi pausa durante a espera) ou "isr" (~1-2 µs).
         Devolve, por pino, os eventos (duração do bounce, transições, larguras de pulso), frequência
         e duty de sinais periódicos, e o caminho do CSV salvo no Mac."""
         return json.dumps(an.capture(settle_us=settle_us, ms=ms, trigger=trigger or None, edge=edge,
-                                     timeout_ms=timeout_ms, pull=pull, pins=pins or None), ensure_ascii=False)
+                                     timeout_ms=timeout_ms, pull=pull, pins=pins or None, tmode=tmode),
+                          ensure_ascii=False)
 
     @mcp.tool()
-    def test_generator(pin: str = "IO10", hz: int = 1000, duty: int = 50) -> str:
-        """Liga um gerador de onda quadrada (LEDC) no próprio canal para autoteste (hz=0 desliga).
-        Só usar com NADA externo ligado nesse pino."""
-        return json.dumps(an.gen(pin, hz, duty), ensure_ascii=False)
+    def test_generator(pin: str = "IO10", hz: int = 1000, duty: int = 50, mode: str = "square",
+                       delay_ms: int = 500) -> str:
+        """Gerador de teste no próprio canal: mode="square" (onda quadrada, hz=0 desliga) ou "bounce"
+        (rajada que imita bounce de botão, disparada delay_ms depois). Só usar com NADA externo nesse pino."""
+        return json.dumps(an.gen(pin, hz, duty, mode, delay_ms), ensure_ascii=False)
+
+    @mcp.tool()
+    def selftest() -> str:
+        """Autoteste do analisador sem nada ligado: mede uma rajada de bounce conhecida e uma onda de 10 kHz
+        geradas pelo próprio ESP e compara com o esperado."""
+        return json.dumps(an.selftest(), ensure_ascii=False)
 
     mcp.run()
 
@@ -324,8 +370,11 @@ def main():
     p.add_argument("--ms", type=int, default=100); p.add_argument("--trigger"); p.add_argument("--edge", default="any")
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pull", default="none")
     p.add_argument("--pins"); p.add_argument("--settle-us", type=float, default=5000); p.add_argument("--tag", default="capture")
+    p.add_argument("--tmode", default="poll", choices=["poll", "isr"])
     p = sub.add_parser("analyze"); p.add_argument("csv"); p.add_argument("--settle-us", type=float, default=5000)
     p = sub.add_parser("gen"); p.add_argument("pin"); p.add_argument("--hz", type=int, default=1000); p.add_argument("--duty", type=int, default=50)
+    p.add_argument("--mode", default="square", choices=["square", "bounce"]); p.add_argument("--delay-ms", type=int, default=500)
+    sub.add_parser("selftest")
     sub.add_parser("mcp")
     a = ap.parse_args()
     if a.cmd == "mcp":
@@ -350,10 +399,15 @@ def main():
         elif a.cmd == "levels":
             print(json.dumps(an.levels(a.pull), indent=1))
         elif a.cmd == "gen":
-            print(json.dumps(an.gen(a.pin, a.hz, a.duty)))
+            print(json.dumps(an.gen(a.pin, a.hz, a.duty, a.mode, a.delay_ms)))
+        elif a.cmd == "selftest":
+            r = an.selftest()
+            print(json.dumps(r, indent=1))
+            sys.exit(0 if r["ok"] else 1)
         elif a.cmd == "capture":
             print(json.dumps(an.capture(settle_us=a.settle_us, tag=a.tag, ms=a.ms, trigger=a.trigger, edge=a.edge,
-                                        timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins), indent=1, ensure_ascii=False))
+                                        timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode),
+                             indent=1, ensure_ascii=False))
         elif a.cmd == "ota":
             res = an.ota(a.bin, a.expect)
             print(json.dumps(res, indent=1, ensure_ascii=False))

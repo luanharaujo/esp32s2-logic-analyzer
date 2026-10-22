@@ -18,8 +18,30 @@ TOKEN = analyzer.TOKEN_FILE.read_text().strip()
 state = {"boot": 1, "fw": "0.2.0", "t0": time.time(), "gen": None}
 
 
+PATTERN = [3, 5, 12, 8, 40, 25, 20000, 4, 6, 15, 10, 60]
+
+
 def fake_csv(q: dict) -> str:
     ms = int(q.get("ms", ["100"])[0])
+    if state.get("bounce") and q.get("pins", [""])[0] == "IO10":  # rajada do gerador, borda a borda
+        state["bounce"] = False
+        lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall pins=IO10",
+                 "# initial IO10=1", "cycles,pin,level"]
+        t, lv = 0, 0
+        for d in PATTERN:
+            lines.append(f"{t},IO10,{lv}")
+            t += d * HZ // 1_000_000
+            lv ^= 1
+        lines.append(f"# end edges={len(PATTERN)} overflow=0 max_gap_cycles=22 status=ok loops=1 max_edges=1 wait_ms=800 err=")
+        return "\n".join(lines) + "\n"
+    if state.get("sq") and q.get("pins", [""])[0] == "IO11":  # 10 kHz, 30 %
+        lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=none edge=any pins=IO11",
+                 "# initial IO11=0", "cycles,pin,level"]
+        per = HZ // 10000
+        for k in range(ms * 10):
+            lines.append(f"{k * per},IO11,1"); lines.append(f"{k * per + per * 3 // 10},IO11,0")
+        lines.append("# end edges=1 overflow=0 max_gap_cycles=22 status=ok loops=1 max_edges=1 err=")
+        return "\n".join(lines) + "\n"
     trig = q.get("trigger", ["none"])[0]
     lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=up trigger={trig} edge=fall pins=IO10,IO11",
              "# initial IO10=1 IO11=0", "cycles,pin,level"]
@@ -65,7 +87,11 @@ class H(BaseHTTPRequestHandler):
             return self.reply(403, '{"ok":false,"err":"token"}')
         n = int(self.headers.get("Content-Length", 0)); d = self.rfile.read(n)
         if u.path == "/gen":
+            if q.get("mode", ["square"])[0] == "bounce":
+                state["bounce"] = True
+                return self.reply(200, json.dumps({"ok": True, "gen": q["pin"][0], "mode": "bounce", "pattern_us": PATTERN}))
             state["gen"] = int(q["hz"][0]) > 0
+            state["sq"] = q["pin"][0] == "IO11" and int(q["hz"][0]) == 10000
             self.reply(200, json.dumps({"ok": True, "gen": q["pin"][0]}))
         elif u.path == "/ota":
             if hashlib.sha256(d).hexdigest() != self.headers.get("X-SHA256"):
@@ -107,6 +133,9 @@ off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.p
                                 capture_output=True, text=True).stdout)
 check("analyze offline igual", off["pins"]["IO10"]["events"][0]["transitions"] == 6)
 csv_path.unlink()
+st = an.selftest()
+check("selftest bounce", st["bounce"]["ok"], st["bounce"])
+check("selftest square", st["square"]["ok"], st["square"])
 binp = ROOT / "firmware/build/s2la.bin"
 if binp.exists():
     r = an.ota(str(binp), expect="0.2.1")

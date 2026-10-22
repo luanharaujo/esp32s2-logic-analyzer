@@ -4,8 +4,9 @@
 // lê os 8 de uma vez). Um laço em IRAM, com interrupções mascaradas, lê os pinos e o contador de ciclos
 // (240 MHz, 4,17 ns) e grava só as mudanças. Cada volta do laço leva poucos ciclos (o max_gap_cycles do
 // CSV diz quanto), então a resolução é de dezenas de ns, bem melhor que 1 µs.
-// Trigger: interrupção de GPIO na borda pedida; a captura roda dentro da própria ISR (latência de ~1 a
-// 2 µs entre a borda real e o t=0). Sem trigger, a captura começa na hora.
+// Trigger (padrão tmode=poll): o mesmo laço espera a borda em fatias de 100 ms com interrupções mascaradas
+// (latência ~0,1 µs; ~1% do tempo cego, nas pausas de 1 ms para o Wi-Fi). tmode=isr: interrupção de GPIO,
+// Wi-Fi livre na espera, mas ~1 a 2 µs de latência. Sem trigger, a captura começa na hora.
 // Limites: janela de até CAP_MAX_MS (Wi-Fi e ticks ficam parados durante a janela) e o buffer de bordas
 // (RAM interna livre). Sem pré-trigger por enquanto.
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #include "driver/gpio.h"
 #include "driver/dedic_gpio.h"
 #include "driver/ledc.h"
+#include "driver/rmt.h"
 #include "hal/cpu_ll.h"
 #include "xtensa/core-macros.h"
 #include "capture.h"
@@ -38,6 +40,7 @@ static const char *TAG = "CAP";
 #define N_CH 8
 #define CAP_MAX_MS 2000
 #define TRIG_MAX_TIMEOUT_MS 60000
+#define POLL_SLICE_MS 100
 
 // Ordem dos canais = bits do bundle. Nome = rótulo na devboard. Pino = número no header do Flipper.
 static const int ch_gpio[N_CH] = { 10, 11, 12, 13, 1, 2, 18, 17 };
@@ -69,12 +72,19 @@ static DRAM_ATTR cap_t cap;
 
 static inline uint32_t IRAM_ATTR read_in(void) { return cpu_ll_read_dedic_gpio_in() & 0xFF; }
 
-// O laço quente. Chamado com interrupções mascaradas.
-static void IRAM_ATTR capture_loop(uint32_t last) {
+// O laço quente. Chamado com interrupções mascaradas. start: ciclo do t=0. first_in >= 0: grava esse
+// valor como a primeira borda em t=0 (a borda do trigger detectada pelo laço de espera).
+static void IRAM_ATTR capture_loop(uint32_t last, uint32_t start, int first_in) {
     uint32_t *t = cap.t;
     uint8_t *v = cap.v;
     uint32_t n = 0, max_edges = cap.max_edges, win = cap.win_cycles, max_gap = 0, loops = 0;
-    uint32_t start = XTHAL_GET_CCOUNT(), prev = start;
+    if (first_in >= 0 && (uint32_t)first_in != last) {
+        t[0] = 0;
+        v[0] = (uint8_t)first_in;
+        n = 1;
+        last = (uint32_t)first_in;
+    }
+    uint32_t prev = XTHAL_GET_CCOUNT();
     while (1) {
         uint32_t now = XTHAL_GET_CCOUNT();
         uint32_t in = read_in();
@@ -97,6 +107,32 @@ static void IRAM_ATTR capture_loop(uint32_t last) {
     cap.final = (uint8_t)last;
 }
 
+// Espera o trigger lendo os pinos no mesmo laço apertado (latência de ~0,1 µs), por no máximo slice
+// ciclos. Devolve 0 se não veio; 1 se veio (em *t_trig, com *in_trig = valor depois da borda e *plast =
+// valor antes); 2 se já veio na 1a leitura (a borda pode ter ocorrido na pausa entre fatias).
+enum { EDGE_ANY = 0, EDGE_RISE = 1, EDGE_FALL = 2 };
+static int IRAM_ATTR wait_trigger(uint32_t *plast, uint32_t bit, int edge, uint32_t slice, uint32_t *t_trig,
+                                  uint32_t *in_trig) {
+    uint32_t last = *plast, t0 = XTHAL_GET_CCOUNT();
+    bool first = true;
+    while (1) {
+        uint32_t now = XTHAL_GET_CCOUNT();
+        uint32_t in = read_in();
+        if ((in ^ last) & bit) {
+            bool rise = (in & bit) != 0;
+            if (edge == EDGE_ANY || (edge == EDGE_RISE && rise) || (edge == EDGE_FALL && !rise)) {
+                *t_trig = now;
+                *in_trig = in;
+                *plast = last;
+                return first ? 2 : 1;
+            }
+        }
+        last = in;
+        first = false;
+        if (now - t0 > slice) { *plast = last; return 0; }
+    }
+}
+
 // Desliga a interrupção do pino direto no registrador (seguro dentro da ISR)
 static inline void IRAM_ATTR gpio_ll_intr_disable_irq(int gpio) { GPIO.pin[gpio].int_type = 0; }
 
@@ -104,7 +140,7 @@ static void IRAM_ATTR trigger_isr(void *arg) {
     if (cap.done) return;
     gpio_ll_intr_disable_irq(ch_gpio[cap.trig_ch]);
     uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
-    capture_loop(cap.initial);
+    capture_loop(cap.initial, XTHAL_GET_CCOUNT(), -1);
     XTOS_RESTORE_INTLEVEL(ps);
     cap.done = true;
     BaseType_t hp = pdFALSE;
@@ -186,16 +222,17 @@ static esp_err_t channels_handler(httpd_req_t *req) {
 // GET /capture?ms=100&trigger=IO10&edge=fall|rise|any&timeout_ms=10000&pull=up|down|none&pins=IO10,IO11
 // Resposta: CSV no formato gpio_edges v1 (o mesmo do projeto do Flipper), com cpu_hz=240000000.
 static esp_err_t capture_handler(httpd_req_t *req) {
-    char q[200] = "", tmp[64];
+    char q[240] = "", tmp[64];
     httpd_req_get_url_query_str(req, q, sizeof(q));
     int ms = 100, timeout_ms = 10000;
-    char pull[8] = "none", edge[8] = "any", pins[64] = "";
+    char pull[8] = "none", edge[8] = "any", pins[64] = "", tmode[8] = "poll";
     int trig = -1;
     if (qparam(q, "ms", tmp, sizeof(tmp))) ms = atoi(tmp);
     if (qparam(q, "timeout_ms", tmp, sizeof(tmp))) timeout_ms = atoi(tmp);
     qparam(q, "pull", pull, sizeof(pull));
     qparam(q, "edge", edge, sizeof(edge));
     qparam(q, "pins", pins, sizeof(pins));
+    qparam(q, "tmode", tmode, sizeof(tmode));
     if (qparam(q, "trigger", tmp, sizeof(tmp)) && tmp[0]) {
         trig = ch_index(tmp);
         if (trig < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "trigger: canal invalido"); return ESP_OK; }
@@ -239,15 +276,17 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     int64_t t_arm = esp_timer_get_time();
     int64_t waited_us = 0;
 
+    int edge_code = strcmp(edge, "rise") == 0 ? EDGE_RISE : strcmp(edge, "fall") == 0 ? EDGE_FALL : EDGE_ANY;
     if (trig < 0) {
         uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
         cap.initial = read_in();
-        capture_loop(cap.initial);
+        capture_loop(cap.initial, XTHAL_GET_CCOUNT(), -1);
         XTOS_RESTORE_INTLEVEL(ps);
         cap.done = true;
-    } else {
-        gpio_int_type_t it = strcmp(edge, "rise") == 0 ? GPIO_INTR_POSEDGE
-                           : strcmp(edge, "fall") == 0 ? GPIO_INTR_NEGEDGE : GPIO_INTR_ANYEDGE;
+    } else if (strcmp(tmode, "isr") == 0) {
+        // Trigger por interrupção: Wi-Fi livre durante a espera, mas ~1 a 2 µs de latência (pode perder
+        // pulsos de bounce mais curtos que isso logo no começo)
+        gpio_int_type_t it = edge_code == EDGE_RISE ? GPIO_INTR_POSEDGE : edge_code == EDGE_FALL ? GPIO_INTR_NEGEDGE : GPIO_INTR_ANYEDGE;
         cap.initial = read_in();
         gpio_isr_handler_add(ch_gpio[trig], trigger_isr, NULL);
         gpio_set_intr_type(ch_gpio[trig], it);
@@ -258,15 +297,37 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         }
         gpio_intr_disable(ch_gpio[trig]);
         gpio_isr_handler_remove(ch_gpio[trig]);
-        waited_us = esp_timer_get_time() - t_arm;
+    } else {
+        // Trigger por varredura (padrão): espera no laço apertado em fatias de POLL_SLICE_MS com as
+        // interrupções mascaradas, soltando ~1 ms entre fatias para o Wi-Fi respirar. Latência ~0,1 µs.
+        // Se a borda cair na pausa, é vista no começo da fatia seguinte (status=trigger_in_gap).
+        uint32_t last = read_in(), t_trig = 0, in_trig = 0;
+        cap.initial = last;
+        int64_t deadline = t_arm + (int64_t)timeout_ms * 1000;
+        int r = 0;
+        while (esp_timer_get_time() < deadline) {
+            uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
+            r = wait_trigger(&last, 1u << trig, edge_code, POLL_SLICE_MS * (CPU_HZ / 1000), &t_trig, &in_trig);
+            if (r) {
+                cap.initial = last;
+                capture_loop(last, t_trig, (int)in_trig);
+            }
+            XTOS_RESTORE_INTLEVEL(ps);
+            if (r) break;
+            vTaskDelay(1);
+        }
+        if (!r) status = "timeout";
+        else if (r == 2) status = "trigger_in_gap";
+        cap.done = true;
     }
+    waited_us = esp_timer_get_time() - t_arm;
     if (cap.overflow) status = "overflow";
 
     // CSV
     httpd_resp_set_type(req, "text/csv");
     char line[256];
-    int len = snprintf(line, sizeof(line), "# gpio_edges v1 mode=s2dedic cpu_hz=%u ms=%d pull=%s trigger=%s edge=%s pins=",
-                       CPU_HZ, ms, pull, trig >= 0 ? ch_name[trig] : "none", edge);
+    int len = snprintf(line, sizeof(line), "# gpio_edges v1 mode=s2dedic cpu_hz=%u ms=%d pull=%s trigger=%s edge=%s tmode=%s pins=",
+                       CPU_HZ, ms, pull, trig >= 0 ? ch_name[trig] : "none", edge, tmode);
     bool first = true;
     for (int i = 0; i < N_CH; i++)
         if (mask & (1 << i)) { len += snprintf(line + len, sizeof(line) - len, "%s%s", first ? "" : ",", ch_name[i]); first = false; }
@@ -305,49 +366,107 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// POST /gen?pin=IO10&hz=1000&duty=50 (hz=0 desliga): gerador de teste (LEDC) num canal, com a entrada
-// ligada no mesmo pino: o analisador se mede sozinho, sem nada externo. NÃO usar com sinal externo
-// ligado ao pino (curto entre saídas).
+// POST /gen: gerador de teste num canal, com a entrada ligada no mesmo pino, para o analisador se
+// medir sozinho, sem nada externo. NÃO usar com sinal externo ligado ao pino (curto entre saídas).
+//   /gen?pin=IO10&hz=1000&duty=50              onda quadrada contínua (LEDC); hz=0 desliga tudo
+//   /gen?pin=IO10&mode=bounce&delay_ms=1000    uma rajada que imita um botão com bounce (RMT, 1 µs
+//                                              exato), disparada delay_ms depois (para dar tempo de
+//                                              armar um /capture com trigger)
+// Padrão do bounce (µs, a partir do repouso em 1): ver bounce_pattern.
 static int gen_pin = -1;
-static esp_err_t gen_handler(httpd_req_t *req) {
-    if (auth_check && !auth_check(req)) return ESP_OK;
-    char q[100] = "", tmp[32] = "";
-    httpd_req_get_url_query_str(req, q, sizeof(q));
-    int hz = qparam(q, "hz", tmp, sizeof(tmp)) ? atoi(tmp) : 0;
-    int duty = qparam(q, "duty", tmp, sizeof(tmp)) ? atoi(tmp) : 50;
-    int ch = qparam(q, "pin", tmp, sizeof(tmp)) ? ch_index(tmp) : 0;
-    if (ch < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pin invalido"); return ESP_OK; }
+static enum { GEN_OFF, GEN_LEDC, GEN_RMT } gen_mode = GEN_OFF;
+static esp_timer_handle_t gen_timer = NULL;
+static rmt_item32_t bounce_items[24];
+static int bounce_n = 0;
+// nível, duração em µs. Pressão (6 bordas de bounce, depois 20 ms em 0), soltura (5 bordas, volta a 1)
+static const int16_t bounce_pattern[][2] = {
+    {0, 3}, {1, 5}, {0, 12}, {1, 8}, {0, 40}, {1, 25}, {0, 20000},
+    {1, 4}, {0, 6}, {1, 15}, {0, 10}, {1, 60},
+};
+
+static void gen_release(void) {
+    if (gen_mode == GEN_LEDC) ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
+    if (gen_mode == GEN_RMT) rmt_driver_uninstall(RMT_CHANNEL_0);
     if (gen_pin >= 0) {
-        ledc_stop(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
         gpio_reset_pin(gen_pin);
         gpio_set_direction(gen_pin, GPIO_MODE_INPUT);
         // devolve o pino ao bundle (o reset desfaz a ligação de entrada da matriz)
         dedic_gpio_del_bundle(bundle);
         dedic_gpio_bundle_config_t cfg = { .gpio_array = ch_gpio, .array_size = N_CH, .flags = { .in_en = 1 } };
         dedic_gpio_new_bundle(&cfg, &bundle);
-        gen_pin = -1;
     }
-    char buf[160];
-    if (hz <= 0) {
-        httpd_resp_set_type(req, "application/json");
-        httpd_resp_sendstr(req, "{\"ok\":true,\"gen\":\"off\"}\n");
+    gen_pin = -1;
+    gen_mode = GEN_OFF;
+}
+
+static void gen_fire(void *arg) {
+    if (gen_mode == GEN_RMT) rmt_write_items(RMT_CHANNEL_0, bounce_items, bounce_n, false);
+}
+
+static esp_err_t gen_handler(httpd_req_t *req) {
+    if (auth_check && !auth_check(req)) return ESP_OK;
+    char q[120] = "", tmp[32] = "", mode[12] = "square";
+    httpd_req_get_url_query_str(req, q, sizeof(q));
+    int hz = qparam(q, "hz", tmp, sizeof(tmp)) ? atoi(tmp) : 0;
+    int duty = qparam(q, "duty", tmp, sizeof(tmp)) ? atoi(tmp) : 50;
+    int delay_ms = qparam(q, "delay_ms", tmp, sizeof(tmp)) ? atoi(tmp) : 500;
+    int ch = qparam(q, "pin", tmp, sizeof(tmp)) ? ch_index(tmp) : 0;
+    qparam(q, "mode", mode, sizeof(mode));
+    if (ch < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pin invalido"); return ESP_OK; }
+    if (gen_timer) esp_timer_stop(gen_timer);
+    gen_release();
+    char buf[200];
+    httpd_resp_set_type(req, "application/json");
+    if (strcmp(mode, "bounce") == 0) {
+        rmt_config_t rc = RMT_DEFAULT_CONFIG_TX(ch_gpio[ch], RMT_CHANNEL_0);
+        rc.clk_div = 80;  // APB 80 MHz / 80 = 1 µs por tick
+        rc.tx_config.idle_output_en = true;
+        rc.tx_config.idle_level = RMT_IDLE_LEVEL_HIGH;
+        rc.tx_config.carrier_en = false;
+        if (rmt_config(&rc) != ESP_OK || rmt_driver_install(RMT_CHANNEL_0, 0, 0) != ESP_OK) {
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "rmt"); return ESP_OK;
+        }
+        int np = sizeof(bounce_pattern) / sizeof(bounce_pattern[0]);
+        bounce_n = 0;
+        for (int i = 0; i < np; i += 2) {
+            rmt_item32_t it = { .level0 = bounce_pattern[i][0], .duration0 = bounce_pattern[i][1] };
+            if (i + 1 < np) { it.level1 = bounce_pattern[i + 1][0]; it.duration1 = bounce_pattern[i + 1][1]; }
+            else { it.level1 = 1; it.duration1 = 0; }
+            bounce_items[bounce_n++] = it;
+        }
+        if (np % 2 == 0) bounce_items[bounce_n++] = (rmt_item32_t){ .level0 = 1, .duration0 = 0, .level1 = 1, .duration1 = 0 };
+        gpio_set_direction(ch_gpio[ch], GPIO_MODE_INPUT_OUTPUT);  // mantém a entrada do bundle viva
+        gen_pin = ch_gpio[ch];
+        gen_mode = GEN_RMT;
+        if (!gen_timer) {
+            esp_timer_create_args_t ta = { .callback = gen_fire, .name = "gen" };
+            esp_timer_create(&ta, &gen_timer);
+        }
+        delay_ms = MAX(0, MIN(delay_ms, 60000));
+        esp_timer_start_once(gen_timer, (uint64_t)delay_ms * 1000 + 1);
+        int len = snprintf(buf, sizeof(buf), "{\"ok\":true,\"gen\":\"%s\",\"mode\":\"bounce\",\"delay_ms\":%d,\"pattern_us\":[",
+                           ch_name[ch], delay_ms);
+        for (int i = 0; i < np && len < (int)sizeof(buf) - 12; i++)
+            len += snprintf(buf + len, sizeof(buf) - len, "%s%d", i ? "," : "", bounce_pattern[i][1]);
+        snprintf(buf + len, sizeof(buf) - len, "]}\n");
+        httpd_resp_sendstr(req, buf);
         return ESP_OK;
     }
+    if (hz <= 0) { httpd_resp_sendstr(req, "{\"ok\":true,\"gen\":\"off\"}\n"); return ESP_OK; }
     duty = MAX(1, MIN(duty, 99));
     ledc_timer_config_t tc = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0,
                                .duty_resolution = LEDC_TIMER_8_BIT, .freq_hz = hz, .clk_cfg = LEDC_AUTO_CLK };
     if (hz > 150000) tc.duty_resolution = LEDC_TIMER_4_BIT;
-    esp_err_t err = ledc_timer_config(&tc);
-    if (err != ESP_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frequencia invalida"); return ESP_OK; }
+    if (ledc_timer_config(&tc) != ESP_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frequencia invalida"); return ESP_OK; }
     uint32_t full = 1u << tc.duty_resolution;
     ledc_channel_config_t cc = { .gpio_num = ch_gpio[ch], .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
                                  .timer_sel = LEDC_TIMER_0, .duty = full * duty / 100, .hpoint = 0 };
     ledc_channel_config(&cc);
-    gpio_set_direction(ch_gpio[ch], GPIO_MODE_INPUT_OUTPUT);  // mantém a entrada do bundle viva
+    gpio_set_direction(ch_gpio[ch], GPIO_MODE_INPUT_OUTPUT);
     gen_pin = ch_gpio[ch];
-    snprintf(buf, sizeof(buf), "{\"ok\":true,\"gen\":\"%s\",\"hz\":%lu,\"duty\":%d}\n", ch_name[ch],
+    gen_mode = GEN_LEDC;
+    snprintf(buf, sizeof(buf), "{\"ok\":true,\"gen\":\"%s\",\"mode\":\"square\",\"hz\":%lu,\"duty\":%d}\n", ch_name[ch],
              (unsigned long)ledc_get_freq(LEDC_LOW_SPEED_MODE, LEDC_TIMER_0), duty);
-    httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
     return ESP_OK;
 }
