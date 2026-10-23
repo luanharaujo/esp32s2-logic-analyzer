@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <stddef.h>
 #include "esp_err.h"
 #include "esp_http_server.h"
 
@@ -15,3 +16,12 @@ void capture_unlock(void);
 bool capture_is_busy(void);
 // Registra /adc (captura analógica no ADC1, em adc_cap.c)
 void adc_register(httpd_handle_t server);
+// ADC em segundo plano para a captura combinada (adc_cap.c). adc_bg_open devolve NULL ou a mensagem de erro.
+const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_digital);
+uint32_t adc_bg_chain_samples(void);
+uint32_t adc_bg_period_cycles(void);
+void adc_bg_restart(uint32_t *t0);
+uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t *invalid);
+uint32_t adc_bg_mv(uint32_t raw);
+int adc_bg_header(char *out, size_t n);
+void adc_bg_close(void);

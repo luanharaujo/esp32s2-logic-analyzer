@@ -41,7 +41,7 @@ static const char *TAG = "CAP";
 #define CPU_HZ 240000000u
 #define N_CH 8
 #define CAP_MAX_MS 2000
-#define TRIG_MAX_TIMEOUT_MS 60000
+#define TRIG_MAX_TIMEOUT_MS 300000
 #define POLL_SLICE_MS 100
 
 // Ordem dos canais = bits do bundle. Nome = rótulo na devboard. Pino = número no header do Flipper.
@@ -226,12 +226,19 @@ static esp_err_t channels_handler(httpd_req_t *req) {
 }
 
 // GET /capture?ms=100&trigger=IO10&edge=fall|rise|any&timeout_ms=10000&pull=up|down|none&pins=IO10,IO11
+//              [&adc_pin=IO1&adc_rate=20000&adc_atten=11]
 // Resposta: CSV no formato gpio_edges v1 (o mesmo do projeto do Flipper), com cpu_hz=240000000.
+// Com adc_pin (captura combinada): o ADC1 amostra esse pino por DMA durante a janela digital e o CSV
+// ganha, depois do "# end", uma seção "# adc_samples v1 ... t0=digital" com cycles,raw,mv, em ciclos
+// de 240 MHz desde o MESMO t0 das bordas (negativos = antes do trigger). A cadeia de DMA cobre no
+// máximo "chain" amostras; com trigger por varredura, a fatia de espera encolhe para que ao menos
+// min(ms, metade da cadeia) fique depois do trigger. Só tmode=poll (ou sem trigger).
 static esp_err_t capture_handler(httpd_req_t *req) {
     char q[240] = "", tmp[64];
     httpd_req_get_url_query_str(req, q, sizeof(q));
     int ms = 100, timeout_ms = 10000;
-    char pull[8] = "none", edge[8] = "any", pins[64] = "", tmode[8] = "poll";
+    char pull[8] = "none", edge[8] = "any", pins[64] = "", tmode[8] = "poll", adc_pin[12] = "", adc_atten[8] = "11";
+    int adc_rate = 20000;
     int trig = -1;
     if (qparam(q, "ms", tmp, sizeof(tmp))) ms = atoi(tmp);
     if (qparam(q, "timeout_ms", tmp, sizeof(tmp))) timeout_ms = atoi(tmp);
@@ -239,6 +246,13 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     qparam(q, "edge", edge, sizeof(edge));
     qparam(q, "pins", pins, sizeof(pins));
     qparam(q, "tmode", tmode, sizeof(tmode));
+    qparam(q, "adc_pin", adc_pin, sizeof(adc_pin));
+    qparam(q, "adc_atten", adc_atten, sizeof(adc_atten));
+    if (qparam(q, "adc_rate", tmp, sizeof(tmp))) adc_rate = atoi(tmp);
+    bool use_adc = adc_pin[0] != 0;
+    if (use_adc && trig >= 0 && strcmp(tmode, "isr") == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "adc_pin: so com tmode=poll ou sem trigger"); return ESP_OK;
+    }
     if (qparam(q, "trigger", tmp, sizeof(tmp)) && tmp[0]) {
         trig = ch_index(tmp);
         if (trig < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "trigger: canal invalido"); return ESP_OK; }
@@ -282,6 +296,23 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     }
 
     apply_pull(pull);
+    uint16_t *abuf = NULL;
+    uint32_t a_chain = 0, a_period = 0, t_adc0 = 0, t_zero = 0;
+    if (use_adc) {
+        int ai = ch_index(adc_pin);
+        const char *aerr = adc_bg_open(adc_pin, adc_rate, adc_atten, ai >= 0 && (mask & (1 << ai)));
+        if (!aerr) {
+            a_chain = adc_bg_chain_samples();
+            a_period = adc_bg_period_cycles();
+            abuf = heap_caps_malloc(a_chain * 2, MALLOC_CAP_SPIRAM);
+            if (!abuf) abuf = heap_caps_malloc(a_chain * 2, MALLOC_CAP_8BIT);
+            if (!abuf) aerr = "adc: sem memoria";
+        }
+        if (aerr) {
+            adc_bg_close(); free(abuf); free(tbuf); free(vbuf); xSemaphoreGive(cap_lock);
+            httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, aerr); return ESP_OK;
+        }
+    }
     vTaskDelay(pdMS_TO_TICKS(2));  // pull assentar
     cap.n = 0; cap.overflow = 0; cap.max_gap = 0; cap.loops = 0; cap.final = 0;
     cap.t = tbuf; cap.v = vbuf; cap.max_edges = max_edges;
@@ -294,10 +325,22 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     int64_t waited_us = 0;
 
     int edge_code = strcmp(edge, "rise") == 0 ? EDGE_RISE : strcmp(edge, "fall") == 0 ? EDGE_FALL : EDGE_ANY;
+    // Fatia da espera por varredura: com ADC, curta o bastante para a cadeia de DMA (renovada a cada
+    // fatia) ainda cobrir min(ms, metade da cadeia) depois do trigger
+    uint32_t slice = POLL_SLICE_MS * (CPU_HZ / 1000);
+    if (use_adc) {
+        uint64_t chain_cyc = (uint64_t)a_chain * a_period;
+        uint64_t post = MIN((uint64_t)cap.win_cycles, chain_cyc / 2);
+        uint64_t sl = chain_cyc - post;
+        sl = MAX(sl, 2ull * (CPU_HZ / 1000));
+        slice = (uint32_t)MIN(sl, (uint64_t)slice);
+    }
     if (trig < 0) {
+        if (use_adc) adc_bg_restart(&t_adc0);
         uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
         cap.initial = read_in();
-        capture_loop(cap.initial, XTHAL_GET_CCOUNT(), -1);
+        t_zero = XTHAL_GET_CCOUNT();
+        capture_loop(cap.initial, t_zero, -1);
         XTOS_RESTORE_INTLEVEL(ps);
         cap.done = true;
     } else if (strcmp(tmode, "isr") == 0) {
@@ -323,8 +366,9 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         int64_t deadline = t_arm + (int64_t)timeout_ms * 1000;
         int r = 0;
         while (esp_timer_get_time() < deadline) {
+            if (use_adc) adc_bg_restart(&t_adc0);
             uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
-            r = wait_trigger(&last, 1u << trig, edge_code, POLL_SLICE_MS * (CPU_HZ / 1000), &t_trig, &in_trig);
+            r = wait_trigger(&last, 1u << trig, edge_code, slice, &t_trig, &in_trig);
             if (r) {
                 cap.initial = last;
                 capture_loop(last, t_trig, (int)in_trig);
@@ -333,6 +377,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
             if (r) break;
             vTaskDelay(1);
         }
+        t_zero = t_trig;
         if (!r) status = "timeout";
         else if (r == 2) status = "trigger_in_gap";
         cap.done = true;
@@ -374,6 +419,33 @@ static esp_err_t capture_handler(httpd_req_t *req) {
                    (unsigned long)edges_out, (unsigned long)cap.overflow, (unsigned long)cap.max_gap, status,
                    (unsigned long)cap.loops, (unsigned long)max_edges, bufkind, waited_us / 1000);
     httpd_resp_send_chunk(req, line, len);
+    if (use_adc) {
+        // Amostras da cadeia que caem até o fim da janela; a amostra i sai em t_adc0 + (i+1) períodos
+        int64_t until = (int64_t)(int32_t)(t_zero - t_adc0) + cap.win_cycles;
+        uint32_t n_keep = until > 0 ? (uint32_t)MIN((uint64_t)a_chain, (uint64_t)until / a_period) : 0;
+        if (strcmp(status, "timeout") == 0) n_keep = 0;
+        uint32_t a_invalid = 0;
+        uint32_t chunk_ms = (uint32_t)((uint64_t)a_chain / 5 * a_period / (CPU_HZ / 1000));
+        uint32_t a_n = adc_bg_collect(abuf, n_keep, chunk_ms + 300, &a_invalid);
+        adc_bg_close();
+        len = adc_bg_header(line, sizeof(line));
+        if (len <= 0) len = snprintf(line, sizeof(line), "# adc_samples v1 pin=%s t0=digital\n", adc_pin);
+        len += snprintf(line + len, sizeof(line) - len, "cycles,raw,mv\n");
+        httpd_resp_send_chunk(req, line, len);
+        olen = 0;
+        int32_t off = (int32_t)(t_adc0 - t_zero);
+        for (uint32_t k = 0; k < a_n; k++) {
+            if (olen > (int)sizeof(out) - 40) { httpd_resp_send_chunk(req, out, olen); olen = 0; }
+            int64_t c = (int64_t)off + (int64_t)(k + 1) * a_period;
+            olen += snprintf(out + olen, sizeof(out) - olen, "%lld,%u,%lu\n", c, (unsigned)abuf[k], (unsigned long)adc_bg_mv(abuf[k]));
+        }
+        if (olen) httpd_resp_send_chunk(req, out, olen);
+        len = snprintf(line, sizeof(line), "# adc_end samples=%lu wanted=%lu chain=%lu invalid=%lu period_cycles=%lu first_cycles=%lld slice_ms=%lu\n",
+                       (unsigned long)a_n, (unsigned long)n_keep, (unsigned long)a_chain, (unsigned long)a_invalid,
+                       (unsigned long)a_period, (long long)off + a_period, (unsigned long)(slice / (CPU_HZ / 1000)));
+        httpd_resp_send_chunk(req, line, len);
+        free(abuf);
+    }
     httpd_resp_send_chunk(req, NULL, 0);
     ESP_LOGI(TAG, "captura %s: %lu bordas, %lu voltas, gap max %lu ciclos", status, (unsigned long)edges_out,
              (unsigned long)cap.loops, (unsigned long)cap.max_gap);
