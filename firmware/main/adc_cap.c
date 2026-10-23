@@ -124,6 +124,7 @@ static esp_err_t adc_handler(httpd_req_t *req) {
     bool rise = strcmp(edge, "rise") == 0;
 
     if (capture_is_busy()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
+    record_discard_if_done();
     if (!capture_lock(0)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
 
     uint32_t n_buf = n_want + (trig_mv >= 0 ? (uint32_t)pre : 0);
@@ -349,6 +350,25 @@ uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t
             if (d[i].type1.channel != bg_pin->ch) { (*invalid)++; continue; }
             buf[k++] = d[i].type1.data;
         }
+    }
+    return k;
+}
+
+// Uma leitura do anel (modo contínuo, sem stop no meio): até max amostras, espera até timeout_ms.
+uint32_t adc_bg_read(uint16_t *buf, uint32_t max, uint32_t timeout_ms, uint32_t *invalid) {
+    static uint8_t *chunk = NULL;  // PSRAM: a RAM interna é pouca
+    const uint32_t CHUNK = 1024;
+    if (!chunk) chunk = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
+    if (!chunk || !bg_pin || !bg_alive || !bg_started) return 0;
+    uint32_t got = 0, k = 0;
+    uint32_t want = MIN(max * 2, CHUNK) & ~3u;
+    if (want == 0) return 0;
+    esp_err_t r = adc_digi_read_bytes(chunk, want, &got, timeout_ms);
+    if (r == ESP_ERR_TIMEOUT || !got) return 0;
+    const adc_digi_output_data_t *d = (const adc_digi_output_data_t *)chunk;
+    for (uint32_t i = 0; i < got / 2 && k < max; i++) {
+        if (d[i].type1.channel != bg_pin->ch) { (*invalid)++; continue; }
+        buf[k++] = d[i].type1.data;
     }
     return k;
 }

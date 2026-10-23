@@ -457,7 +457,9 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "                      CSV de bordas (formato gpio_edges v1, ciclos de 240 MHz)\n"
         "POST /gen?pin=IO10&hz=1000&duty=50   gerador de teste no canal (hz=0 desliga; X-Token)\n"
         "GET  /adc?pin=IO10&ms=100&rate=83333&atten=11[&trig_mv=1650&edge=fall&pre=100]\n"
-        "                      CSV analogico (us,raw,mv; ADC1: IO10, IO1, IO2)\n");
+        "                      CSV analogico (us,raw,mv; ADC1: IO10, IO1, IO2)\n"
+        "POST /record?s=120&pins=IO10[&adc_pin=IO1&adc_rate=10000]  gravacao continua (ate 280 s)\n"
+        "GET  /record/status | GET /record/data | POST /record/stop[?discard=1]\n");
     return ESP_OK;
 }
 
@@ -628,7 +630,7 @@ static void start_http(void) {
     httpd_handle_t server = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = 8192;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 10;
     if (httpd_start(&server, &cfg) != ESP_OK) {
@@ -646,6 +648,7 @@ static void start_http(void) {
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) httpd_register_uri_handler(server, &uris[i]);
     capture_register(server);
     adc_register(server);
+    record_register(server);
     http_started = true;
     ESP_LOGI(TAG, "HTTP em :80");
 }

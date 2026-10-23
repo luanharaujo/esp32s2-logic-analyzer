@@ -200,6 +200,10 @@ static void apply_pull(const char *pull) {
     for (int i = 0; i < N_CH; i++) gpio_set_pull_mode(ch_gpio[i], m);
 }
 
+int capture_ch_index(const char *name) { return ch_index(name); }
+const char *capture_ch_name(int i) { return (i >= 0 && i < N_CH) ? ch_name[i] : "?"; }
+void capture_apply_pull(const char *pull) { apply_pull(pull); }
+
 static bool qparam(const char *q, const char *key, char *out, size_t n) {
     return q && httpd_query_key_value(q, key, out, n) == ESP_OK;
 }
@@ -278,6 +282,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         }
     } else mask = 0xFF;
     if (busy_check && busy_check()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
+    record_discard_if_done();
     if (xSemaphoreTake(cap_lock, 0) != pdTRUE) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
 
     // Buffer: o maior bloco livre de RAM interna, deixando folga para Wi-Fi e HTTP. Se não couber
@@ -330,6 +335,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     cap.done = false;
     xSemaphoreTake(cap.done_sem, 0);
     const char *status = "ok";
+    double blind_pct = -1;
     int64_t t_arm = esp_timer_get_time();
     int64_t waited_us = 0;
 
@@ -381,10 +387,14 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         int64_t deadline = t_arm + (int64_t)timeout_ms * 1000;
         int r = 0;
         int slices = 0;
+        int64_t restart_us = 0, masked_us = 0;
         while (esp_timer_get_time() < deadline) {
             if ((++slices & 3) == 0 && client_gone(req)) { status = "client_gone"; break; }
             diag_mark("cap:slice");
+            int64_t tr = esp_timer_get_time();
             if (use_adc) adc_bg_restart(&t_adc0);
+            int64_t tm = esp_timer_get_time();
+            restart_us += tm - tr;
             uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
             r = wait_trigger(&last, 1u << trig, edge_code, slice, &t_trig, &in_trig);
             if (r) {
@@ -392,9 +402,15 @@ static esp_err_t capture_handler(httpd_req_t *req) {
                 capture_loop(last, t_trig, (int)in_trig);
             }
             XTOS_RESTORE_INTLEVEL(ps);
+            masked_us += esp_timer_get_time() - tm;
             if (r) break;
             vTaskDelay(1);
         }
+        // fração do tempo de espera em que o pino NÃO estava sendo olhado (pausas + remontagem do ADC)
+        int64_t waited = esp_timer_get_time() - t_arm;
+        blind_pct = waited > 0 ? 100.0 * (double)(waited - masked_us) / (double)waited : 0;
+        ESP_LOGI(TAG, "espera: %d fatias, %.1f%% cego, remontagem do ADC %lld us por fatia", slices, blind_pct,
+                 slices ? restart_us / slices : 0);
         t_zero = t_trig;
         if (!r && strcmp(status, "client_gone") != 0) status = "timeout";
         else if (r == 2) status = "trigger_in_gap";
@@ -440,9 +456,9 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     }
     if (olen) httpd_resp_send_chunk(req, out, olen);
     len = snprintf(line, sizeof(line),
-                   "# end edges=%lu overflow=%lu max_gap_cycles=%lu status=%s loops=%lu max_edges=%lu buf=%s wait_ms=%lld err=\n",
+                   "# end edges=%lu overflow=%lu max_gap_cycles=%lu status=%s loops=%lu max_edges=%lu buf=%s wait_ms=%lld blind_pct=%.1f err=\n",
                    (unsigned long)edges_out, (unsigned long)cap.overflow, (unsigned long)cap.max_gap, status,
-                   (unsigned long)cap.loops, (unsigned long)max_edges, bufkind, waited_us / 1000);
+                   (unsigned long)cap.loops, (unsigned long)max_edges, bufkind, waited_us / 1000, blind_pct);
     httpd_resp_send_chunk(req, line, len);
     if (use_adc) {
         // Amostras da cadeia que caem até o fim da janela; a amostra i sai em t_adc0 + (i+1) períodos

@@ -29,3 +29,11 @@ void adc_bg_close(void);
 void diag_mark(const char *what);
 // true se o cliente HTTP fechou a conexão (para cancelar uma espera longa)
 bool client_gone(httpd_req_t *req);
+uint32_t adc_bg_read(uint16_t *buf, uint32_t max, uint32_t timeout_ms, uint32_t *invalid);
+// Canais (capture.c), para o modo de gravação contínua (record.c)
+int capture_ch_index(const char *name);
+const char *capture_ch_name(int i);
+void capture_apply_pull(const char *pull);
+// Gravação contínua (record.c)
+void record_register(httpd_handle_t server);
+bool record_discard_if_done(void);
