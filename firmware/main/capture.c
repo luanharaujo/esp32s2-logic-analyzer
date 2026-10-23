@@ -28,6 +28,8 @@
 #include "esp_cpu.h"
 #include "driver/gpio.h"
 #include "driver/dedic_gpio.h"
+#include "soc/gpio_periph.h"
+#include "soc/io_mux_reg.h"
 #include "driver/ledc.h"
 #include "driver/rmt.h"
 #include "hal/cpu_ll.h"
@@ -439,6 +441,10 @@ static esp_err_t gen_handler(httpd_req_t *req) {
         }
         int np = sizeof(bounce_pattern) / sizeof(bounce_pattern[0]);
         bounce_n = 0;
+        // 50 ms em repouso (alto) feitos pelo próprio RMT antes da rajada: o esp_timer que dispara o RMT
+        // só roda quando as interrupções voltam (na pausa de 1 ms do trigger por varredura), então sem
+        // este atraso de hardware a 1a borda cairia sempre na pausa (status trigger_in_gap).
+        bounce_items[bounce_n++] = (rmt_item32_t){ .level0 = 1, .duration0 = 25000, .level1 = 1, .duration1 = 25000 };
         for (int i = 0; i < np; i += 2) {
             rmt_item32_t it = { .level0 = bounce_pattern[i][0], .duration0 = bounce_pattern[i][1] };
             if (i + 1 < np) { it.level1 = bounce_pattern[i + 1][0]; it.duration1 = bounce_pattern[i + 1][1]; }
@@ -446,7 +452,9 @@ static esp_err_t gen_handler(httpd_req_t *req) {
             bounce_items[bounce_n++] = it;
         }
         if (np % 2 == 0) bounce_items[bounce_n++] = (rmt_item32_t){ .level0 = 1, .duration0 = 0, .level1 = 1, .duration1 = 0 };
-        gpio_set_direction(ch_gpio[ch], GPIO_MODE_INPUT_OUTPUT);  // mantém a entrada do bundle viva
+        // religa só a entrada do pad (o bundle lê o próprio sinal). gpio_set_direction(INPUT_OUTPUT)
+        // NÃO serve: reconecta o pad ao sinal GPIO simples e desliga o RMT/LEDC (pino fica fixo).
+        PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ch_gpio[ch]]);
         gen_pin = ch_gpio[ch];
         gen_mode = GEN_RMT;
         if (!gen_timer) {
@@ -473,7 +481,7 @@ static esp_err_t gen_handler(httpd_req_t *req) {
     ledc_channel_config_t cc = { .gpio_num = ch_gpio[ch], .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
                                  .timer_sel = LEDC_TIMER_0, .duty = full * duty / 100, .hpoint = 0 };
     ledc_channel_config(&cc);
-    gpio_set_direction(ch_gpio[ch], GPIO_MODE_INPUT_OUTPUT);
+    PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ch_gpio[ch]]);  // ver comentário no modo bounce
     gen_pin = ch_gpio[ch];
     gen_mode = GEN_LEDC;
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"gen\":\"%s\",\"mode\":\"square\",\"hz\":%lu,\"duty\":%d}\n", ch_name[ch],
