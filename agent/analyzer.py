@@ -27,6 +27,8 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py plot --auto arq.csv [--show]                     # janela inteira + zoom no 1º evento
     uv run agent/analyzer.py series --n 9 --ms 1500 --trigger IO10 --edge fall --timeout-ms 300000 --gap-s 2
                                     --tag t2 [--groups caneta:3,chassi:3,dedo:3] [--adc-pin IO1] [--show]
+    uv run agent/analyzer.py record --s 120 --pins IO10 [--adc-pin IO1 --adc-rate 10000] [--live] [--show]
+                                    # gravação contínua (fw >= 0.4.0): lista de eventos com hora + PNG
     uv run agent/analyzer.py mcp                  # servidor MCP (stdio)
 Host: --host, ou S2LA_HOST, ou logic-s2.local. Token (rotas que alteram o ESP): ~/.config/s2la/token.
 """
@@ -270,7 +272,7 @@ def parse_edges_csv(text: str) -> dict:
     return {"meta": meta, "initial": initial, "end": end, "rows": rows}
 
 
-def analyze(parsed: dict, settle_us: float = 5000.0) -> dict:
+def analyze(parsed: dict, settle_us: float = 5000.0, max_events: int = 50) -> dict:
     """Resumo por pino: bordas, rajadas (bounce) separadas por silêncio > settle_us."""
     hz = float(parsed["meta"].get("cpu_hz", 240_000_000))
     pins = parsed["meta"].get("pins", "").split(",") if parsed["meta"].get("pins") else []
@@ -294,7 +296,7 @@ def analyze(parsed: dict, settle_us: float = 5000.0) -> dict:
         if cur:
             groups.append(cur)
         gsum = []
-        for g in groups[:50]:
+        for g in groups[:max_events]:
             widths = [round(b[0] - a[0], 3) for a, b in zip(g, g[1:])]
             gsum.append({
                 "start_us": round(g[0][0], 3), "bounce_us": round(g[-1][0] - g[0][0], 3),
@@ -303,7 +305,7 @@ def analyze(parsed: dict, settle_us: float = 5000.0) -> dict:
                 "pulses_us": widths[:40],
             })
         info = {"initial": parsed["initial"].get(pin), "edges": len(rs), "events": gsum}
-        if len(groups) > 50:
+        if len(groups) > max_events:
             info["events_truncated"] = len(groups)
         if len(rs) >= 10:  # sinal periódico: frequência e duty médios (só com bordas suficientes)
             per = [b[0] - a[0] for a, b in zip(rs, rs[1:])]
@@ -454,6 +456,9 @@ def analyze_any(text: str, settle_us: float = 5000.0, compare_pin: str | None = 
     if adc_txt:
         ap = parse_combined_adc(adc_txt)
         a = analyze_adc(ap)
+        if ap["meta"].get("mode") == "events":  # janelas soltas por evento: ruído de rede não faz sentido
+            for kk in ("tone_50hz_mv", "tone_60hz_mv", "stable_ms"):
+                a.pop(kk, None)
         a["end"] = ap["end"]
         res["adc"] = a
         pin = compare_pin or (dig["meta"].get("trigger") if dig["meta"].get("trigger") not in (None, "none") else "IO10")
@@ -517,13 +522,14 @@ def _data_range_ms(d: dict) -> tuple[float, float]:
     return lo, (hi if hi > lo else lo + 1.0)
 
 
-def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = ""):
+def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = "", origin_ms: float | None = None):
     """Um painel: degraus do digital (um por pino, empilhados) e o analógico em mV no eixo da direita."""
     import numpy as np
     lo, hi = _data_range_ms(d)
     t0 = lo if t0 is None else t0
     t1 = hi if t1 is None else t1
     k = 1000.0 if t1 - t0 < 1.0 else 1.0  # janela < 1 ms: eixo em µs
+    o = origin_ms or 0.0  # origem do eixo (ex.: início do evento)
     n_edges = 0
     if d["dig"]:
         dig = d["dig"]
@@ -541,7 +547,7 @@ def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = "")
             tt = np.concatenate([[t0], t[m], [t1]])
             vv = np.concatenate([[vi], v[m], [v[m][-1] if m.any() else vi]])
             off = 1.5 * (len(pins) - 1 - i)
-            ax.step(tt * k, vv + off, where="post", lw=0.8, color=PLOT_DIGITAL_COLOR)
+            ax.step((tt - o) * k, vv + off, where="post", lw=0.8, color=PLOT_DIGITAL_COLOR)
         if len(pins) == 1:
             ax.set_ylim(-0.2, 1.2); ax.set_yticks([0, 1]); ax.set_ylabel(f"{pins[0]} (nível)")
         else:
@@ -552,19 +558,27 @@ def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = "")
         t = np.array(a["us"]) / 1e3; mv = np.array(a["mv"])
         m = (t >= t0) & (t <= t1)
         ax2 = ax.twinx() if d["dig"] else ax
-        ax2.plot(t[m] * k, mv[m], lw=0.8, color=PLOT_ADC_COLOR, marker="." if m.sum() < 120 else None, ms=3)
+        tt, yy = (t[m] - o) * k, mv[m].astype(float)
+        if len(tt) > 2:  # quebra a linha onde faltam amostras (janelas por evento na gravação contínua)
+            per = float(np.median(np.diff(tt)))
+            br = np.where(np.diff(tt) > 3 * per)[0] + 1
+            tt, yy = np.insert(tt, br, np.nan), np.insert(yy, br, np.nan)
+        ax2.plot(tt, yy, lw=0.8, color=PLOT_ADC_COLOR, marker="." if m.sum() < 120 else None, ms=3)
         rng = float(a["meta"].get("range_mv", 0) or 0) or (mv.max() if len(mv) else 2500)
         ax2.set_ylim(-0.08 * rng, 1.08 * rng)
         ax2.set_ylabel(f"{a['meta'].get('pin', 'ADC')} (mV)", color=PLOT_ADC_COLOR)
         ax2.tick_params(axis="y", colors=PLOT_ADC_COLOR)
         if not d["dig"]:
             n_edges = None
-    ax.set_xlim(t0 * k, t1 * k)
-    ax.set_xlabel("tempo (µs)" if k > 1 else "tempo (ms)")
+    ax.set_xlim((t0 - o) * k, (t1 - o) * k)
+    ax.ticklabel_format(axis="x", useOffset=False, style="plain")
+    unit = "µs" if k > 1 else "ms"
+    ax.set_xlabel(f"tempo desde o evento ({unit})" if origin_ms is not None else f"tempo ({unit})")
     ax.set_title(title or d["path"].name, fontsize=11, loc="left")
     ax.grid(alpha=0.3)
     if n_edges is not None:
-        ax.text(0.99, 1.02, f"{n_edges} borda{'' if n_edges == 1 else 's'}", transform=ax.transAxes, fontsize=9, color="#a33", ha="right", va="bottom")
+        ax.text(0.99, 0.97, f"{n_edges} borda{'' if n_edges == 1 else 's'}", transform=ax.transAxes, fontsize=9, color="#a33",
+                ha="right", va="top", bbox=dict(facecolor="white", edgecolor="none", alpha=0.8, pad=1))
 
 
 def parse_panel(spec: str) -> tuple[Path, float | None, float | None, str]:
@@ -743,6 +757,126 @@ def series_pngs(caps: list, tag: str) -> list[Path]:
     return pngs
 
 
+# ---------------------------------------------------------------------------------------------------
+# Gravação contínua (firmware >= 0.4.0): uma janela longa, sem rearmar, com a lista de eventos
+
+def plot_record_png(path: Path, events: list, out: Path, title: str = "", max_events: int = 12) -> Path:
+    """PNG 9x9: visão geral da gravação em cima (largura toda) e um zoom por evento embaixo (2 colunas)."""
+    import math
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    d = load_plot_data(path)
+    evs = events[:max_events]
+    rows = 1 + math.ceil(len(evs) / 2)
+    fig = plt.figure(figsize=(9, 9), dpi=110)
+    gs = fig.add_gridspec(rows, 2, height_ratios=[1.4] + [1] * (rows - 1))
+    ax = fig.add_subplot(gs[0, :])
+    lo, hi = _data_range_ms(d)
+    plot_panel(ax, d, lo, hi, f"gravação inteira: {len(events)} eventos")
+    for e in events:
+        ax.axvline(e["start_us"] / 1e3, color="#a33", lw=0.5, alpha=0.5)
+    for i, e in enumerate(evs):
+        a = fig.add_subplot(gs[1 + i // 2, i % 2])
+        s, b = e["start_us"], e["bounce_us"]
+        margin = max(50.0, 0.2 * b)
+        nb = e["transitions"]
+        plot_panel(a, d, (s - margin) / 1e3, (s + b + margin) / 1e3,
+                   f"#{i + 1} {e.get('kind', '')} {e.get('wall', '')}: {nb} borda{'' if nb == 1 else 's'}, {_br(b)} µs",
+                   origin_ms=s / 1e3)
+        a.title.set_fontsize(9)
+        a.xaxis.label.set_fontsize(8); a.tick_params(labelsize=7)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def parse_bursts(text: str) -> list[dict]:
+    """Linhas "# burst t0 t1 n final" (rajadas depois do buffer cheio) -> lista em µs."""
+    out = []
+    for line in text.splitlines():
+        if line.startswith("# burst "):
+            _, _, t0, t1, n, fin = line.split()
+            out.append({"start_us": int(t0) / 240.0, "bounce_us": (int(t1) - int(t0)) / 240.0, "transitions": int(n),
+                        "final_level": int(fin), "only_summary": True})
+    return out
+
+
+def run_record(an: "Analyzer", s: int = 120, pins: str = "IO10", pull: str = "none", settle_ms: float = 5.0,
+               adc_pin: str | None = None, adc_rate: int = 10000, adc_pre_ms: int = 20, adc_post_ms: int = 80,
+               tag: str = "rec", live: bool = False, show: bool = False, out=print) -> dict:
+    """Gravação contínua de s segundos no ESP. Sem --live, o Mac não fala com o ESP durante a gravação
+    (cada consulta de progresso pausa a varredura por alguns ms). No fim baixa o CSV, lista os eventos
+    com a hora e gera o PNG (visão geral + zoom por evento)."""
+    fw = an.status().get("fw", "")
+    if _fw_tuple(fw) < (0, 4, 0):
+        raise AnalyzerError(f"gravação contínua precisa do firmware 0.4.0 ou mais novo (placa: {fw})")
+    q = {"s": s, "pins": pins, "pull": pull, "settle_ms": max(1, round(settle_ms))}
+    if adc_pin:
+        q.update(adc_pin=adc_pin, adc_rate=adc_rate, adc_pre_ms=adc_pre_ms, adc_post_ms=adc_post_ms)
+    r = json.loads(an.request("/record?" + urllib.parse.urlencode(q), method="POST", data=b""))
+    t_start = time.time()
+    out(f"{datetime.fromtimestamp(t_start):%H:%M:%S} gravando {s} s em {pins}"
+        f"{' + ADC ' + adc_pin if adc_pin else ''} (até {r.get('max_edges')} bordas). Pode apertar.")
+    shown = 0
+    try:
+        while time.time() - t_start < s:
+            time.sleep(min(5.0, max(0.2, s - (time.time() - t_start))))
+            if live:
+                st = json.loads(an.request("/record/status"))
+                n, last = st.get("events", 0), st.get("last_events_s", [])
+                first_idx = n - len(last)
+                for k in range(max(shown, first_idx), n):
+                    ts = t_start + last[k - first_idx]
+                    out(f"  evento {k + 1} às {datetime.fromtimestamp(ts):%H:%M:%S}  ({st.get('edges')} bordas até agora)")
+                shown = n
+            else:
+                left = s - (time.time() - t_start)
+                if left > 1:
+                    out(f"  ... faltam {left:.0f} s")
+    except KeyboardInterrupt:
+        out("interrompido: encerrando a gravação e baixando o que já foi gravado")
+        an.request("/record/stop", method="POST", data=b"")
+    text = an.request("/record/data", timeout=s + 120).decode()
+    path = save_capture(text, tag)
+    dig_txt, _ = split_combined(text)
+    parsed = parse_edges_csv(dig_txt)
+    res = analyze(parsed, settle_ms * 1000, max_events=5000)
+    end = parsed["end"]
+    pins_l = [p for p in pins.split(",") if p]
+    main_pin = pins_l[0] if pins_l else "IO10"
+    events = list(res["pins"].get(main_pin, {}).get("events", []))
+    events += parse_bursts(dig_txt)
+    idle = parsed["initial"].get(main_pin, 1)
+    for e in events:
+        e["wall"] = f"{datetime.fromtimestamp(t_start + e['start_us'] / 1e6):%H:%M:%S.%f}"[:-3]
+        e["kind"] = "aperto" if e["final_level"] != idle else "soltura"  # repouso = nível inicial
+    gaps = {k: int(end.get(k, 0) or 0) for k in ("gaps_over_2us", "gaps_over_10us", "gaps_over_100us", "gaps_over_1ms")}
+    n_press = sum(e["kind"] == "aperto" for e in events)
+    out(f"{len(events)} eventos em {main_pin}: {n_press} apertos, {len(events) - n_press} solturas ({end.get('total_edges', end.get('edges'))} bordas, status {end.get('status')}); "
+        f"pausas da varredura: {gaps['gaps_over_100us']} > 100 µs, {gaps['gaps_over_1ms']} > 1 ms, "
+        f"máx {_br(int(end.get('max_gap_cycles', 0) or 0) / 240.0, 1)} µs")
+    for i, e in enumerate(events):
+        extra = " (só resumo: buffer cheio)" if e.get("only_summary") else ""
+        out(f"  #{i + 1} {e['wall']}  +{_br(e['start_us'] / 1e6, 3)} s  {e['kind']}: {e['transitions']} bordas, "
+            f"bounce {_br(e['bounce_us'])} µs, termina em {e['final_level']}{extra}")
+    png = None
+    if events or parsed["rows"]:
+        png = plot_record_png(path, [e for e in events if not e.get("only_summary")],
+                              CAPTURE_DIR / f"{path.stem}.png",
+                              f"Gravação {tag}: {main_pin}, {datetime.fromtimestamp(t_start):%H:%M:%S}")
+        out(f"CSV: {path}\ngráfico: {png}")
+        if show:
+            show_png([png])
+    return {"fw": fw, "csv_local": str(path), "png": str(png) if png else None, "events": events, "presses": n_press, "end": end,
+            "start": datetime.fromtimestamp(t_start).isoformat(timespec="seconds")}
+
+
 def run_mcp():
     from mcp.server.fastmcp import FastMCP
 
@@ -828,6 +962,17 @@ def run_mcp():
         return str(out)
 
     @mcp.tool()
+    def record(s: int = 60, pins: str = "IO10", settle_ms: float = 5.0, adc_pin: str = "", adc_rate: int = 10000,
+               show: bool = False) -> str:
+        """Gravação contínua (firmware >= 0.4.0) de s segundos (até 280) sem rearmar: para testes de bancada com
+        vários apertos. Varredura com interrupções ligadas (~1% cego em pausas curtas). Devolve a lista de
+        eventos (hora, bordas, duração do bounce), pausas da varredura, CSV e PNG (visão geral + zoom por
+        evento). adc_pin: janela analógica por evento (alinhamento aproximado). Bloqueia por s segundos."""
+        r = run_record(an, s=s, pins=pins, settle_ms=settle_ms, adc_pin=adc_pin or None, adc_rate=adc_rate,
+                       show=show, out=lambda x: None)
+        return json.dumps(r, ensure_ascii=False)
+
+    @mcp.tool()
     def selftest() -> str:
         """Autoteste do analisador sem nada ligado: mede uma rajada de bounce conhecida e uma onda de 10 kHz
         geradas pelo próprio ESP e compara com o esperado."""
@@ -865,6 +1010,12 @@ def main():
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pre", type=int, default=100)
     p.add_argument("--tag", default="adc")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
+    p = sub.add_parser("record"); p.add_argument("--s", type=int, default=120); p.add_argument("--pins", default="IO10")
+    p.add_argument("--pull", default="none"); p.add_argument("--settle-ms", type=float, default=5.0)
+    p.add_argument("--adc-pin"); p.add_argument("--adc-rate", type=int, default=10000)
+    p.add_argument("--adc-pre-ms", type=int, default=20); p.add_argument("--adc-post-ms", type=int, default=80)
+    p.add_argument("--tag", default="rec"); p.add_argument("--live", action="store_true", help="mostra os eventos ao vivo (cada consulta pausa a varredura ~2 a 9 ms)")
+    p.add_argument("--show", action="store_true")
     p = sub.add_parser("plot"); p.add_argument("panels", nargs="*", help='"arquivo|t0_ms|t1_ms|título"')
     p.add_argument("--auto", help="CSV: janela inteira + zoom no 1º evento"); p.add_argument("-o", "--out")
     p.add_argument("--title", default=""); p.add_argument("--show", action="store_true")
@@ -928,6 +1079,10 @@ def main():
                                         timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode,
                                         adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten),
                              indent=1, ensure_ascii=False))
+        elif a.cmd == "record":
+            run_record(an, s=a.s, pins=a.pins, pull=a.pull, settle_ms=a.settle_ms, adc_pin=a.adc_pin, adc_rate=a.adc_rate,
+                       adc_pre_ms=a.adc_pre_ms, adc_post_ms=a.adc_post_ms, tag=a.tag, live=a.live, show=a.show,
+                       out=lambda x: print(x, flush=True))
         elif a.cmd == "series":
             r = run_series(an, a.n, ms=a.ms, trigger=a.trigger, edge=a.edge, timeout_ms=a.timeout_ms, gap_s=a.gap_s,
                            tag=a.tag, groups=a.groups, settle_us=a.settle_us, pull=a.pull, pins=a.pins,

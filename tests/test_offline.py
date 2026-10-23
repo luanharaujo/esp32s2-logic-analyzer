@@ -103,6 +103,31 @@ def fake_adc(q: dict):
     return "\n".join(lines) + "\n"
 
 
+def fake_record_csv() -> str:
+    """Gravação contínua: 3 apertos (bounce de 3 bordas + soltura) em 0,5 s, 1,2 s e 2,0 s; depois do
+    buffer cheio, 1 rajada só em resumo; janela analógica do 1o evento."""
+    C = 240
+    lines = ["# gpio_edges v1 mode=s2record cpu_hz=240000000 ms=3000 pull=none trigger=none edge=any tmode=record pins=IO10",
+             "# initial IO10=1", "cycles,pin,level"]
+    for t_s in (0.5, 1.2, 2.0):
+        t0 = int(t_s * 1e6) * C
+        for k, (dt, lv) in enumerate([(0, 0), (4, 1), (9, 0), (150000, 1)]):
+            lines.append(f"{t0 + dt * C},IO10,{lv}")
+    lines.append("# end edges=12 overflow=1 max_gap_cycles=24000 status=buffer_full loops=1 max_edges=12 buf=psram total_edges=20 "
+                 "events=4 gaps_over_2us=100 gaps_over_10us=10 gaps_over_100us=3 gaps_over_1ms=0 max_gap_at_ms=1.0 "
+                 "bursts_after_full=1 settle_ticks=75000 err=")
+    lines.append(f"# burst {int(2.6e6) * C} {int(2.6e6 + 50) * C} 8 0")
+    lines.append("# adc_samples v1 pin=IO1 atten_range_mv=2500 rate=10000 rate_real=10000.0 bits=12 t0=digital mode=events "
+                 "pre_ms=20 post_ms=80 align=esp_timer")
+    lines.append("cycles,raw,mv")
+    for k in range(-200, 800):
+        c = int(0.5e6 * C) + k * 24000
+        lv = 30 if 0 <= k < 1500 else 4095
+        lines.append(f"{c},{lv},{lv * 2500 // 4095}")
+    lines.append("# adc_end samples=1000 wanted=1000 windows=1 lost_events=0 invalid=0 period_cycles=24000")
+    return "\n".join(lines) + "\n"
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -131,6 +156,10 @@ class H(BaseHTTPRequestHandler):
                 self.reply(400, "pino do ADC2 (conflita com o Wi-Fi); use IO10, IO1 ou IO2 (ADC1)", "text/plain")
             else:
                 self.reply(200, body, "text/csv")
+        elif u.path == "/record/status":
+            self.reply(200, json.dumps({"ok": True, "state": "recording", "events": 2, "edges": 8, "last_events_s": [0.5, 1.2]}))
+        elif u.path == "/record/data":
+            self.reply(200, fake_record_csv(), "text/csv")
         elif u.path == "/levels":
             self.reply(200, json.dumps({"ok": True, "raw": 1, "ch": {c: int(i == 0) for i, c in enumerate(analyzer.CHANNELS)}}))
         elif u.path == "/channels":
@@ -140,9 +169,12 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); q = parse_qs(u.query)
-        if self.headers.get("X-Token") != TOKEN:
+        if self.headers.get("X-Token") != TOKEN and not u.path.startswith("/record"):  # /record não exige token
             return self.reply(403, '{"ok":false,"err":"token"}')
         n = int(self.headers.get("Content-Length", 0)); d = self.rfile.read(n)
+        if u.path == "/record":
+            state["record_q"] = q
+            return self.reply(200, json.dumps({"ok": True, "s": int(q["s"][0]), "max_edges": 250000}))
         if u.path == "/gen":
             if q.get("mode", ["square"])[0] == "bounce":
                 state["bounce"] = True
@@ -247,6 +279,26 @@ for c in sr["captures"]:
     Path(c["csv"]).unlink()
 for x in sr["png"]:
     Path(x).unlink()
+# record (fw >= 0.4.0): 3 eventos completos + 1 só em resumo, PNG, recusa em fw antigo
+state.update(fw="0.4.3", reboot_on_status=0)
+lines = []
+rr = analyzer.run_record(an, s=1, pins="IO10", adc_pin="IO1", tag="teste_rec", live=True, out=lines.append)
+check("record: parâmetros", state["record_q"]["s"] == ["1"] and state["record_q"]["adc_pin"] == ["IO1"], state.get("record_q"))
+check("record: 7 eventos, 4 apertos (1 em resumo)", len(rr["events"]) == 7 and rr["presses"] == 4
+      and rr["events"][6].get("only_summary") and rr["events"][1]["kind"] == "soltura", rr["events"])
+check("record: 1º evento 3 bordas em 9 µs", rr["events"][0]["transitions"] == 3 and abs(rr["events"][0]["bounce_us"] - 9) < 0.01,
+      rr["events"][0])
+check("record: hora de parede", all(len(e["wall"]) == 12 for e in rr["events"]), [e["wall"] for e in rr["events"]])
+check("record: eventos ao vivo", sum("evento" in x and "às" in x for x in lines) == 2, lines)
+check("record: PNG", rr["png"] and Path(rr["png"]).exists() and plt.imread(rr["png"]).shape[:2] == (990, 990), rr["png"])
+ra = analyzer.analyze_any(Path(rr["csv_local"]).read_text())
+check("record: ADC por evento sem tom", "tone_60hz_mv" not in ra["adc"] and ra["adc"]["samples"] == 1000, ra["adc"])
+Path(rr["csv_local"]).unlink(); Path(rr["png"]).unlink()
+state["fw"] = "0.3.4"
+try:
+    analyzer.run_record(an, s=1, out=lines.append); check("record: recusa fw < 0.4.0", False)
+except analyzer.AnalyzerError as e:
+    check("record: recusa fw < 0.4.0", "0.4.0" in str(e), e)
 state["fw"] = "0.2.0"
 # series: firmware 0.2.0 -> timeout limitado a 60 s e sem ADC; 2 grupos de 1
 lines = []
