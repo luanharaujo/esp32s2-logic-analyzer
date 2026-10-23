@@ -198,6 +198,7 @@ static esp_err_t adc_handler(httpd_req_t *req) {
                     prev_mv = mv;
                 }
                 if (!started && now > t_arm + (int64_t)timeout_ms * 1000) { status = "timeout"; break; }
+                if (!started && (chunks & 63) == 0 && client_gone(req)) { status = "client_gone"; break; }
                 continue;
             }
             for (uint32_t i = 0; i < m && n < n_buf; i++) {
@@ -255,7 +256,10 @@ static esp_err_t adc_handler(httpd_req_t *req) {
 static const adc_pin_t *bg_pin = NULL;
 static uint32_t bg_iomux = 0, bg_chunk = 0;
 static int bg_rate = 0;
-static bool bg_started = false;
+static bool bg_started = false, bg_keep_digital = false, bg_alive = false;
+static adc_digi_init_config_t bg_ic;
+static adc_digi_pattern_config_t bg_pat;
+static adc_digi_configuration_t bg_dc;
 
 const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_digital) {
     const adc_pin_t *p = find_pin(pin);
@@ -275,16 +279,14 @@ const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_
     cal_range_mv = a->range_mv;
     bg_iomux = REG_READ(GPIO_PIN_MUX_REG[p->gpio]);
     // anel > 16 KB para ir para a PSRAM; cabe a cadeia inteira de uma vez (a ISR despeja tudo ao desmascarar)
-    adc_digi_init_config_t ic = { .max_store_buf_size = MAX(17 * 1024, 6 * (uint32_t)chunk), .conv_num_each_intr = (uint32_t)chunk,
-                                  .adc1_chan_mask = BIT(p->ch), .adc2_chan_mask = 0 };
-    esp_err_t err = adc_digi_initialize(&ic);
-    if (err == ESP_OK) {
-        adc_digi_pattern_config_t pat = { .atten = a->atten, .channel = p->ch, .unit = 0, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH };
-        adc_digi_configuration_t dc = { .conv_limit_en = 0, .conv_limit_num = 250, .pattern_num = 1, .adc_pattern = &pat,
+    bg_ic = (adc_digi_init_config_t){ .max_store_buf_size = MAX(17 * 1024, 6 * (uint32_t)chunk), .conv_num_each_intr = (uint32_t)chunk,
+                                      .adc1_chan_mask = BIT(p->ch), .adc2_chan_mask = 0 };
+    bg_pat = (adc_digi_pattern_config_t){ .atten = a->atten, .channel = p->ch, .unit = 0, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH };
+    bg_dc = (adc_digi_configuration_t){ .conv_limit_en = 0, .conv_limit_num = 250, .pattern_num = 1, .adc_pattern = &bg_pat,
                                         .sample_freq_hz = (uint32_t)rate, .conv_mode = ADC_CONV_SINGLE_UNIT_1,
                                         .format = ADC_DIGI_OUTPUT_FORMAT_TYPE1 };
-        err = adc_digi_controller_configure(&dc);
-    }
+    esp_err_t err = adc_digi_initialize(&bg_ic);
+    if (err == ESP_OK) err = adc_digi_controller_configure(&bg_dc);
     if (err != ESP_OK) {
         adc_digi_deinitialize();
         REG_WRITE(GPIO_PIN_MUX_REG[p->gpio], bg_iomux);
@@ -294,6 +296,8 @@ const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_
     // keep_digital: devolve a entrada digital (e os pulls do /capture) ao pad, para o mesmo pino servir
     // também de canal digital. Experimental: o ADC lê o pad com o buffer digital ligado.
     if (keep_digital) REG_WRITE(GPIO_PIN_MUX_REG[p->gpio], bg_iomux);
+    bg_keep_digital = keep_digital;
+    bg_alive = true;
     bg_pin = p;
     bg_chunk = (uint32_t)chunk;
     bg_rate = rate;
@@ -303,15 +307,31 @@ const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_
 uint32_t adc_bg_chain_samples(void) { return bg_pin ? bg_chunk * 5 / 2 : 0; }
 uint32_t adc_bg_period_cycles(void) { return bg_pin ? 96u * adc_interval(bg_rate) : 0; }
 
-// Para o ADC, descarta o que estava no anel e recomeça uma cadeia nova. *t0 = ciclo da CPU logo depois
-// de ligar o disparo (a 1a amostra sai ~1 período depois).
+// Recomeça uma cadeia nova, descartando o que havia. *t0 = ciclo da CPU logo depois de ligar o disparo
+// (a 1a amostra sai ~1 período depois). Não usa adc_digi_stop + adc_digi_start + leitura para esvaziar:
+// depois de um stop no meio de um bloco, o anel do driver da IDF 4.4 fica com pedaços de tamanho que não
+// é múltiplo de 4 e adc_digi_read_bytes dá assert ((size % 4) == 0) -> panic (visto no 0.3.1/0.3.2).
+// Em vez disso, desmonta e remonta o driver (o anel é apagado sem ser lido), ~1 ms.
 void adc_bg_restart(uint32_t *t0) {
     if (!bg_pin) return;
-    if (bg_started) adc_digi_stop();
-    static uint8_t junk[256];
-    uint32_t got = 0;
-    while (adc_digi_read_bytes(junk, sizeof(junk), &got, 0) != ESP_ERR_TIMEOUT && got) {}
-    bg_started = adc_digi_start() == ESP_OK;
+    if (bg_started) {
+        diag_mark("adc:reinit");
+        adc_digi_stop();
+        adc_digi_deinitialize();
+        bg_started = false;
+        bg_alive = false;
+        if (adc_digi_initialize(&bg_ic) != ESP_OK || adc_digi_controller_configure(&bg_dc) != ESP_OK) {
+            adc_digi_deinitialize();
+            ESP_LOGE(TAG, "adc_bg: falha ao remontar");
+            *t0 = cpu_hal_get_cycle_count();
+            return;
+        }
+        if (bg_keep_digital) REG_WRITE(GPIO_PIN_MUX_REG[bg_pin->gpio], bg_iomux);
+        bg_alive = true;
+    }
+    diag_mark("adc:start");
+    bg_started = bg_alive && adc_digi_start() == ESP_OK;
+    diag_mark("adc:running");
     *t0 = cpu_hal_get_cycle_count();
 }
 
@@ -320,7 +340,7 @@ uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t
     static uint8_t chunk[512];
     uint32_t k = 0;
     int64_t deadline = esp_timer_get_time() + (int64_t)timeout_ms * 1000;
-    while (bg_pin && k < n && esp_timer_get_time() < deadline) {
+    while (bg_pin && bg_alive && bg_started && k < n && esp_timer_get_time() < deadline) {
         uint32_t got = 0;
         esp_err_t r = adc_digi_read_bytes(chunk, sizeof(chunk), &got, 20);
         if (r == ESP_ERR_TIMEOUT || !got) continue;
@@ -348,7 +368,8 @@ void adc_bg_close(void) {
     if (!bg_pin) return;
     if (bg_started) adc_digi_stop();
     bg_started = false;
-    adc_digi_deinitialize();
+    if (bg_alive) adc_digi_deinitialize();
+    bg_alive = false;
     REG_WRITE(GPIO_PIN_MUX_REG[bg_pin->gpio], bg_iomux);
     bg_pin = NULL;
 }

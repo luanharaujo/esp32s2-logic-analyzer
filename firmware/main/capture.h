@@ -25,3 +25,7 @@ uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t
 uint32_t adc_bg_mv(uint32_t raw);
 int adc_bg_header(char *out, size_t n);
 void adc_bg_close(void);
+// Marca de progresso em RTC (sobrevive a panic; vira reset_detail no boot seguinte). "" = tudo ok.
+void diag_mark(const char *what);
+// true se o cliente HTTP fechou a conexão (para cancelar uma espera longa)
+bool client_gone(httpd_req_t *req);

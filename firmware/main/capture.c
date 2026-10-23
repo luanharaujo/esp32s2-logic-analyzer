@@ -34,6 +34,8 @@
 #include "driver/rmt.h"
 #include "hal/cpu_ll.h"
 #include "xtensa/core-macros.h"
+#include "lwip/sockets.h"
+#include <errno.h>
 #include "capture.h"
 
 static const char *TAG = "CAP";
@@ -167,6 +169,13 @@ esp_err_t capture_init(bool (*is_busy)(void), bool (*auth)(httpd_req_t *)) {
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
     ESP_LOGI(TAG, "8 canais prontos (dedicated GPIO)");
     return ESP_OK;
+}
+
+bool client_gone(httpd_req_t *req) {
+    int fd = httpd_req_to_sockfd(req);
+    char c;
+    int r = recv(fd, &c, 1, MSG_PEEK | MSG_DONTWAIT);
+    return r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
 }
 
 bool capture_lock(uint32_t wait_ms) { return xSemaphoreTake(cap_lock, pdMS_TO_TICKS(wait_ms)) == pdTRUE; }
@@ -351,9 +360,15 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         gpio_isr_handler_add(ch_gpio[trig], trigger_isr, NULL);
         gpio_set_intr_type(ch_gpio[trig], it);
         gpio_intr_enable(ch_gpio[trig]);
-        if (xSemaphoreTake(cap.done_sem, pdMS_TO_TICKS(timeout_ms)) != pdTRUE) {
+        // espera em pedaços de 500 ms para notar cliente que desistiu
+        bool got = false, gone = false;
+        for (int64_t end = t_arm + (int64_t)timeout_ms * 1000; !got && esp_timer_get_time() < end;) {
+            got = xSemaphoreTake(cap.done_sem, pdMS_TO_TICKS(500)) == pdTRUE;
+            if (!got && client_gone(req)) { gone = true; break; }
+        }
+        if (!got) {
             gpio_set_intr_type(ch_gpio[trig], GPIO_INTR_DISABLE);
-            if (!cap.done) { cap.done = true; status = "timeout"; }
+            if (!cap.done) { cap.done = true; status = gone ? "client_gone" : "timeout"; }
         }
         gpio_intr_disable(ch_gpio[trig]);
         gpio_isr_handler_remove(ch_gpio[trig]);
@@ -365,7 +380,10 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         cap.initial = last;
         int64_t deadline = t_arm + (int64_t)timeout_ms * 1000;
         int r = 0;
+        int slices = 0;
         while (esp_timer_get_time() < deadline) {
+            if ((++slices & 3) == 0 && client_gone(req)) { status = "client_gone"; break; }
+            diag_mark("cap:slice");
             if (use_adc) adc_bg_restart(&t_adc0);
             uint32_t ps = XTOS_SET_INTLEVEL(XCHAL_EXCM_LEVEL);
             r = wait_trigger(&last, 1u << trig, edge_code, slice, &t_trig, &in_trig);
@@ -378,12 +396,19 @@ static esp_err_t capture_handler(httpd_req_t *req) {
             vTaskDelay(1);
         }
         t_zero = t_trig;
-        if (!r) status = "timeout";
+        if (!r && strcmp(status, "client_gone") != 0) status = "timeout";
         else if (r == 2) status = "trigger_in_gap";
         cap.done = true;
     }
     waited_us = esp_timer_get_time() - t_arm;
     if (cap.overflow) status = "overflow";
+    diag_mark("cap:csv");
+    if (strcmp(status, "client_gone") == 0) {
+        ESP_LOGW(TAG, "captura cancelada: cliente desconectou");
+        if (use_adc) { adc_bg_close(); free(abuf); }
+        free(tbuf); free(vbuf); xSemaphoreGive(cap_lock); diag_mark("");
+        return ESP_OK;
+    }
 
     // CSV
     httpd_resp_set_type(req, "text/csv");
@@ -426,9 +451,11 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         if (strcmp(status, "timeout") == 0) n_keep = 0;
         uint32_t a_invalid = 0;
         uint32_t chunk_ms = (uint32_t)((uint64_t)a_chain / 5 * a_period / (CPU_HZ / 1000));
+        diag_mark("cap:adc_collect");
         uint32_t a_n = adc_bg_collect(abuf, n_keep, chunk_ms + 300, &a_invalid);
+        len = adc_bg_header(line, sizeof(line));  // antes do close (o close esquece o pino e a taxa)
+        diag_mark("cap:adc_close");
         adc_bg_close();
-        len = adc_bg_header(line, sizeof(line));
         if (len <= 0) len = snprintf(line, sizeof(line), "# adc_samples v1 pin=%s t0=digital\n", adc_pin);
         len += snprintf(line + len, sizeof(line) - len, "cycles,raw,mv\n");
         httpd_resp_send_chunk(req, line, len);
@@ -447,6 +474,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         free(abuf);
     }
     httpd_resp_send_chunk(req, NULL, 0);
+    diag_mark("");
     ESP_LOGI(TAG, "captura %s: %lu bordas, %lu voltas, gap max %lu ciclos", status, (unsigned long)edges_out,
              (unsigned long)cap.loops, (unsigned long)cap.max_gap);
     free(tbuf);

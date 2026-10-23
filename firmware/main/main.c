@@ -121,6 +121,44 @@ static void rtc_diag_boot(void) {
     rtc_diag.boot_count = boots;
 }
 
+// Motivo do último panic/abort (RTC, sobrevive ao reset). Preenchido pelos wrappers do linker
+// (-Wl,--wrap=esp_panic_handler,--wrap=esp_system_abort); lido e zerado no boot.
+#define PANIC_MAGIC 0x50414E43u
+typedef struct { uint32_t magic; char text[120]; } panic_note_t;
+static RTC_NOINIT_ATTR panic_note_t panic_note;
+static char prev_panic[120] = "";
+
+#include "esp_private/panic_internal.h"
+void __real_esp_panic_handler(panic_info_t *info);
+void __real_esp_system_abort(const char *details);
+IRAM_ATTR void __wrap_esp_system_abort(const char *details) {
+    panic_note.magic = PANIC_MAGIC;
+    strlcpy(panic_note.text, details ? details : "abort", sizeof(panic_note.text));
+    __real_esp_system_abort(details);
+}
+IRAM_ATTR void __wrap_esp_panic_handler(panic_info_t *info) {
+    // abort já anotou os detalhes; só acrescenta se não houver nada
+    if (panic_note.magic != PANIC_MAGIC) {
+        const uint32_t *fr = (const uint32_t *)info->frame;  // XtExcFrame: exit, pc, ps, sar, vpri, a0..
+        panic_note.magic = PANIC_MAGIC;
+        snprintf(panic_note.text, sizeof(panic_note.text), "%s pc=%p a0=0x%08lx", info->reason ? info->reason : "?",
+                 info->addr, fr ? (unsigned long)fr[5] : 0UL);
+    }
+    __real_esp_panic_handler(info);
+}
+
+static void panic_note_boot(void) {
+    if (esp_reset_reason() == ESP_RST_PANIC && panic_note.magic == PANIC_MAGIC) {
+        panic_note.text[sizeof(panic_note.text) - 1] = '\0';
+        strlcpy(prev_panic, panic_note.text, sizeof(prev_panic));
+        for (char *c = prev_panic; *c; c++) if (*c == '"' || *c == '\\' || *c < ' ') *c = ' ';
+    }
+    panic_note.magic = 0;
+}
+
+// Marca de progresso que sobrevive a panic (aparece em reset_detail no boot seguinte)
+void diag_mark(const char *what) { strlcpy(rtc_diag.detail, what, sizeof(rtc_diag.detail)); }
+
 static void restart_with(const char *detail) {
     strlcpy(rtc_diag.detail, detail, sizeof(rtc_diag.detail));
     ESP_LOGW(TAG, "Reiniciando: %s", detail);
@@ -387,7 +425,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
              "\"reset_detail\":\"%s\",\"prev_uptime_s\":%lu,\"boot\":%lu,"
              "\"ssid\":\"%s\",\"bssid\":\"" MACSTR "\",\"ch\":%d,\"rssi\":%d,\"ip\":\"%s\",\"gw\":\"%s\","
              "\"wifi_connects\":%lu,\"wifi_disconnects\":%lu,\"wifi_last_reason\":%u,"
-             "\"mac\":\"" MACSTR "\",\"chip_rev\":%d,\"flash_mb\":%u,\"psram_kb\":%u,\"heap_free\":%u,\"heap_min\":%u,\"heap_int_free\":%u,\"heap_int_largest\":%u}\n",
+             "\"mac\":\"" MACSTR "\",\"chip_rev\":%d,\"flash_mb\":%u,\"psram_kb\":%u,\"heap_free\":%u,\"heap_min\":%u,\"heap_int_free\":%u,\"heap_int_largest\":%u,\"panic\":\"%s\"}\n",
              HOSTNAME, app->version, app->date, app->time, app->idf_ver, run ? run->label : "?",
              ota_pending_verify ? "true" : "false", ota_last, esp_timer_get_time() / 1000000,
              reset_reason_str(), prev_diag_valid ? prev_diag.detail : "",
@@ -398,7 +436,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
              MAC2STR(mac), chip.revision, (unsigned)(spi_flash_get_chip_size() >> 20), (unsigned)(psram / 1024),
              (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL), prev_panic);
     json_reply(req, buf);
     return ESP_OK;
 }
@@ -668,12 +706,14 @@ static void supervisor_task(void *pv) {
 
 void app_main(void) {
     rtc_diag_boot();
+    panic_note_boot();
     orig_vprintf = esp_log_set_vprintf(ring_vprintf);
     led_init();
     const esp_app_desc_t *app = esp_ota_get_app_description();
     ESP_LOGI(TAG, "Boot %s #%lu, reset=%s, detalhe anterior='%s', viveu %lu s", app->version,
              (unsigned long)rtc_diag.boot_count, reset_reason_str(), prev_diag_valid ? prev_diag.detail : "",
              prev_diag_valid ? (unsigned long)prev_diag.last_uptime_s : 0UL);
+    if (prev_panic[0]) ESP_LOGW(TAG, "panic anterior: %s", prev_panic);
     ota_rollback_check_boot();
     capture_init(is_ota_busy, token_ok);
     xTaskCreate(supervisor_task, "supervisor", 3072, NULL, 10, NULL);
