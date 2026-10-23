@@ -58,6 +58,27 @@ def fake_csv(q: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def fake_adc(q: dict):
+    """Botão no IO10 (pull-up 10 kΩ a 3,3 V, satura em 4095) com ruído de 60 Hz de 30 mV e um aperto com
+    bounce lento: cai em 2 ms, volta em 2,3 ms, cai de vez em 2,6 ms."""
+    import math
+    pin = q.get("pin", ["IO10"])[0]
+    if pin in ("IO11", "IO12", "IO13", "IO17", "IO18"):
+        return None
+    rate, ms = int(q.get("rate", ["83333"])[0]), int(q.get("ms", ["100"])[0])
+    n = ms * rate // 1000
+    lines = [f"# adc_samples v1 pin={pin} gpio=10 header_pin=5 unit=1 ch=9 atten=11 range_mv=2500 rate={rate} bits=12 "
+             "cal=nominal trig_mv=-1 edge=none pre=0", "us,raw,mv"]
+    for k in range(n):
+        t = k / rate
+        low = 2e-3 <= t < 2.3e-3 or t >= 2.6e-3
+        mv = (40 if low else 2600) + 30 * math.sin(2 * math.pi * 60 * t)
+        raw = max(0, min(4095, round(mv * 4095 / 2500)))
+        lines.append(f"{k * 1e6 / rate:.1f},{raw},{raw * 2500 // 4095}")
+    lines.append(f"# end samples={n} sps_measured={rate - 3} invalid=0 overflow=0 trig_index=-1 status=ok wait_ms={ms} err=")
+    return "\n".join(lines) + "\n"
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -74,6 +95,12 @@ class H(BaseHTTPRequestHandler):
                                         "ota_pending_verify": False}))
         elif u.path == "/capture":
             self.reply(200, fake_csv(q), "text/csv")
+        elif u.path == "/adc":
+            body = fake_adc(q)
+            if body is None:
+                self.reply(400, "pino do ADC2 (conflita com o Wi-Fi); use IO10, IO1 ou IO2 (ADC1)", "text/plain")
+            else:
+                self.reply(200, body, "text/csv")
         elif u.path == "/levels":
             self.reply(200, json.dumps({"ok": True, "raw": 1, "ch": {c: int(i == 0) for i, c in enumerate(analyzer.CHANNELS)}}))
         elif u.path == "/channels":
@@ -133,6 +160,22 @@ off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.p
                                 capture_output=True, text=True).stdout)
 check("analyze offline igual", off["pins"]["IO10"]["events"][0]["transitions"] == 6)
 csv_path.unlink()
+ad = an.adc(pin="IO10", ms=50, rate=20000, tag="teste_adc")
+check("adc: 1000 amostras", ad["samples"] == 1000, ad)
+check("adc: taxa medida", ad["sps_measured"] == 19997, ad)
+check("adc: satura no alto", ad["saturated_pct"] > 0 and ad["max_mv"] == 2500, ad)
+check("adc: 3 cruzamentos (bounce lento)", ad["crossings"] == 3, ad)
+check("adc: bounce dura 600 µs", abs(ad.get("cross_span_us", 0) - 600) < 60, ad)
+check("adc: ruído de 60 Hz", 15 < ad.get("tone_60hz_mv", 0) < 45, ad)
+adc_path = Path(ad["csv_local"])
+off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze-adc", str(adc_path)],
+                                capture_output=True, text=True).stdout)
+check("analyze-adc offline igual", off["crossings"] == 3, off)
+adc_path.unlink()
+try:
+    an.adc(pin="IO11"); check("adc: ADC2 recusado", False)
+except analyzer.AnalyzerError as e:
+    check("adc: ADC2 recusado", "ADC2" in str(e), e)
 st = an.selftest()
 check("selftest bounce", st["bounce"]["ok"], st["bounce"])
 check("selftest square", st["square"]["ok"], st["square"])
@@ -152,6 +195,6 @@ for m in msgs:
 p.stdout.readline()
 tools = [t["name"] for t in json.loads(p.stdout.readline())["result"]["tools"]]
 p.kill()
-check("MCP tools", set(tools) >= {"status", "capture", "levels", "channels", "test_generator", "device_log"}, tools)
+check("MCP tools", set(tools) >= {"status", "capture", "levels", "channels", "test_generator", "device_log", "adc"}, tools)
 print("FALHAS:", fails)
 sys.exit(1 if fails else 0)

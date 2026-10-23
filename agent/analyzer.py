@@ -18,6 +18,9 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py gen IO10 --hz 1000 [--duty 50] | gen IO10 --hz 0  # gerador de teste no canal
     uv run agent/analyzer.py gen IO10 --mode bounce [--delay-ms 500]          # rajada de bounce de teste
     uv run agent/analyzer.py selftest                                          # autoteste sem nada ligado
+    uv run agent/analyzer.py adc [--pin IO10] [--ms 100] [--rate 83333] [--atten 11]
+                                 [--trig-mv 1650 --edge fall --timeout-ms 10000 --pre 100]  # analógico (ADC1)
+    uv run agent/analyzer.py analyze-adc captures/x_adc.csv                    # offline
     uv run agent/analyzer.py mcp                  # servidor MCP (stdio)
 Host: --host, ou S2LA_HOST, ou logic-s2.local. Token (rotas que alteram o ESP): ~/.config/s2la/token.
 """
@@ -177,6 +180,24 @@ class Analyzer:
         wait = (timeout_ms if trigger else 0) / 1000 + ms / 1000 + 15
         return self.request("/capture?" + urllib.parse.urlencode(q), timeout=wait).decode()
 
+    def adc_csv(self, pin: str = "IO10", ms: int = 100, rate: int = 83333, atten: str = "11",
+                trig_mv: int | None = None, edge: str = "fall", timeout_ms: int = 10000, pre: int = 100) -> str:
+        """Captura analógica no ADC1 (IO10, IO1 ou IO2), CSV adc_samples v1 (us,raw,mv). Sem pull no pino.
+        rate: 611 a 83333 amostras/s; atten 11 dB = 0 a ~2,5 V (acima disso satura). trig_mv: espera
+        cruzar esse nível (edge fall/rise) até timeout_ms, guardando até pre amostras antes."""
+        q = {"pin": pin, "ms": ms, "rate": rate, "atten": atten}
+        if trig_mv is not None:
+            q.update(trig_mv=trig_mv, edge=edge, timeout_ms=timeout_ms, pre=pre)
+        wait = (timeout_ms if trig_mv is not None else 0) / 1000 + ms / 1000 + 30
+        return self.request("/adc?" + urllib.parse.urlencode(q), timeout=wait).decode()
+
+    def adc(self, tag: str = "adc", **kw) -> dict:
+        text = self.adc_csv(**kw)
+        path = save_capture(text, tag)
+        res = analyze_adc(parse_adc_csv(text))
+        res["csv_local"] = str(path)
+        return res
+
     def capture(self, settle_us: float = 5000.0, tag: str = "capture", **kw) -> dict:
         text = self.capture_csv(**kw)
         path = save_capture(text, tag)
@@ -288,6 +309,77 @@ def analyze(parsed: dict, settle_us: float = 5000.0) -> dict:
     return out
 
 
+def parse_adc_csv(text: str) -> dict:
+    """CSV adc_samples v1 -> {"meta": {...}, "end": {...}, "us": [...], "raw": [...], "mv": [...]}."""
+    out = {"meta": {}, "end": {}, "us": [], "raw": [], "mv": []}
+    for line in text.splitlines():
+        if line.startswith("# adc_samples"):
+            out["meta"] = dict(kv.split("=", 1) for kv in line.split()[3:] if "=" in kv)
+        elif line.startswith("# end"):
+            out["end"] = dict(kv.split("=", 1) for kv in line.split()[2:] if "=" in kv)
+        elif line and line[0] in "-0123456789":
+            us, raw, mv = line.split(",")
+            out["us"].append(float(us)); out["raw"].append(int(raw)); out["mv"].append(int(mv))
+    if not out["meta"]:
+        raise AnalyzerError("CSV sem cabeçalho adc_samples v1")
+    return out
+
+
+def _tone_mv(mv: list, rate: float, hz: float) -> float:
+    """Amplitude (mV de pico) da componente de hz Hz, por DFT num número inteiro de ciclos."""
+    import math
+    n = int(len(mv) // (rate / hz) * (rate / hz))
+    if n < rate / hz:
+        return 0.0
+    m = sum(mv[:n]) / n
+    w = 2 * math.pi * hz / rate
+    re_ = sum((mv[k] - m) * math.cos(w * k) for k in range(n))
+    im = sum((mv[k] - m) * math.sin(w * k) for k in range(n))
+    return 2 * math.hypot(re_, im) / n
+
+
+def analyze_adc(parsed: dict, hyst_mv: float = 200.0) -> dict:
+    """Resumo de uma captura analógica: estatística em mV, saturação, cruzamentos do meio da faixa (com
+    histerese, para ver bounce lento), ruído de 50/60 Hz se a janela tiver ao menos um ciclo."""
+    import statistics
+    mv, raw, meta, end = parsed["mv"], parsed["raw"], parsed["meta"], parsed["end"]
+    rate = float(meta.get("rate", 0)) or 1.0
+    out = {"pin": meta.get("pin"), "atten_db": meta.get("atten"), "range_mv": int(meta.get("range_mv", 0)),
+           "cal": meta.get("cal"), "rate_sps": rate, "sps_measured": float(end.get("sps_measured", 0)),
+           "status": end.get("status"), "invalid": int(end.get("invalid", 0)), "samples": len(mv)}
+    if not mv:
+        return out
+    out["window_ms"] = round(len(mv) / rate * 1000, 3)
+    out["sample_period_us"] = round(1e6 / rate, 2)
+    out.update(min_mv=min(mv), max_mv=max(mv), mean_mv=round(statistics.fmean(mv), 1),
+               std_mv=round(statistics.pstdev(mv), 1), saturated_pct=round(100 * sum(r >= 4095 for r in raw) / len(raw), 2))
+    mid = (min(mv) + max(mv)) / 2
+    cross = []
+    if max(mv) - min(mv) > 2 * hyst_mv:
+        hi = mv[0] > mid
+        for k, v in enumerate(mv):
+            if hi and v < mid - hyst_mv / 2:
+                hi = False; cross.append(parsed["us"][k])
+            elif not hi and v > mid + hyst_mv / 2:
+                hi = True; cross.append(parsed["us"][k])
+    out["mid_mv"] = round(mid)
+    out["crossings"] = len(cross)
+    if cross:
+        out["first_cross_us"], out["last_cross_us"] = cross[0], cross[-1]
+        out["cross_span_us"] = round(cross[-1] - cross[0], 1)
+    # Ruído de rede: no trecho estável mais longo (longe dos cruzamentos), para o degrau não contaminar
+    us = parsed["us"]
+    cuts = [0] + [k for k in range(1, len(mv)) if any(abs(us[k] - c) < 0.5 for c in cross)] + [len(mv)]
+    margin = int(rate * 200e-6) + 1
+    seg = max(((a + margin * (a > 0), b - margin * (b < len(mv))) for a, b in zip(cuts, cuts[1:])),
+              key=lambda ab: ab[1] - ab[0])
+    out["stable_ms"] = round(max(0, seg[1] - seg[0]) / rate * 1000, 2)
+    for hz in (50, 60):
+        if seg[1] - seg[0] >= rate / hz:
+            out[f"tone_{hz}hz_mv"] = round(_tone_mv(mv[seg[0]:seg[1]], rate, hz), 1)
+    return out
+
+
 def save_capture(text: str, tag: str = "capture") -> Path:
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     path = CAPTURE_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.csv"
@@ -301,7 +393,8 @@ def run_mcp():
     mcp = FastMCP("logic", instructions=(
         "Analisador lógico de 8 canais pela rede (ESP32-S2 em logic-s2.local, 3,3 V, nunca 5 V). "
         "Canais IO10, IO11, IO12, IO13, IO1, IO2, IO18, IO17; GND comum com o alvo. Use capture com "
-        "trigger para medir bounce de botão; o resultado já vem analisado."))
+        "trigger para medir bounce de botão; o resultado já vem analisado. adc: captura analógica lenta (até "
+        "83 kamostras/s, 12 bits, 0 a ~2,5 V) em IO10, IO1 ou IO2."))
     an = Analyzer()
 
     @mcp.tool()
@@ -346,6 +439,17 @@ def run_mcp():
         return json.dumps(an.gen(pin, hz, duty, mode, delay_ms), ensure_ascii=False)
 
     @mcp.tool()
+    def adc(pin: str = "IO10", ms: int = 100, rate: int = 83333, atten: str = "11", trig_mv: int = -1,
+            edge: str = "fall", timeout_ms: int = 10000, pre: int = 100) -> str:
+        """Captura ANALÓGICA lenta no ADC1 (pinos IO10, IO1 ou IO2; os outros canais são ADC2, que o Wi-Fi
+        usa). rate: 611 a 83333 amostras/s (12 µs por amostra no máximo), 12 bits. atten "11" = 0 a ~2,5 V
+        (3,3 V satura). Não liga pull no pino. trig_mv >= 0: espera o sinal cruzar esse nível (edge fall
+        ou rise) até timeout_ms e guarda pre amostras antes. Devolve min/max/média/desvio em mV, saturação,
+        cruzamentos do meio da faixa, ruído de 50/60 Hz e o caminho do CSV (us,raw,mv) salvo no Mac."""
+        return json.dumps(an.adc(pin=pin, ms=ms, rate=rate, atten=atten, trig_mv=trig_mv if trig_mv >= 0 else None,
+                                 edge=edge, timeout_ms=timeout_ms, pre=pre), ensure_ascii=False)
+
+    @mcp.tool()
     def selftest() -> str:
         """Autoteste do analisador sem nada ligado: mede uma rajada de bounce conhecida e uma onda de 10 kHz
         geradas pelo próprio ESP e compara com o esperado."""
@@ -375,12 +479,21 @@ def main():
     p = sub.add_parser("gen"); p.add_argument("pin"); p.add_argument("--hz", type=int, default=1000); p.add_argument("--duty", type=int, default=50)
     p.add_argument("--mode", default="square", choices=["square", "bounce"]); p.add_argument("--delay-ms", type=int, default=500)
     sub.add_parser("selftest")
+    p = sub.add_parser("adc"); p.add_argument("--pin", default="IO10"); p.add_argument("--ms", type=int, default=100)
+    p.add_argument("--rate", type=int, default=83333); p.add_argument("--atten", default="11", choices=["0", "2.5", "6", "11"])
+    p.add_argument("--trig-mv", type=int); p.add_argument("--edge", default="fall", choices=["fall", "rise"])
+    p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pre", type=int, default=100)
+    p.add_argument("--tag", default="adc")
+    p = sub.add_parser("analyze-adc"); p.add_argument("csv")
     sub.add_parser("mcp")
     a = ap.parse_args()
     if a.cmd == "mcp":
         return run_mcp()
     if a.cmd == "analyze":
         print(json.dumps(analyze(parse_edges_csv(Path(a.csv).read_text()), a.settle_us), indent=1))
+        return
+    if a.cmd == "analyze-adc":
+        print(json.dumps(analyze_adc(parse_adc_csv(Path(a.csv).read_text())), indent=1))
         return
     an = Analyzer(a.host)
     try:
@@ -408,6 +521,9 @@ def main():
             print(json.dumps(an.capture(settle_us=a.settle_us, tag=a.tag, ms=a.ms, trigger=a.trigger, edge=a.edge,
                                         timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode),
                              indent=1, ensure_ascii=False))
+        elif a.cmd == "adc":
+            print(json.dumps(an.adc(tag=a.tag, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, trig_mv=a.trig_mv,
+                                    edge=a.edge, timeout_ms=a.timeout_ms, pre=a.pre), indent=1, ensure_ascii=False))
         elif a.cmd == "ota":
             res = an.ota(a.bin, a.expect)
             print(json.dumps(res, indent=1, ensure_ascii=False))
