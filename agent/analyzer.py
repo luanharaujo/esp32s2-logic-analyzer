@@ -29,6 +29,8 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
                                     --tag t2 [--groups caneta:3,chassi:3,dedo:3] [--adc-pin IO1] [--show]
     uv run agent/analyzer.py record --s 120 --pins IO10 [--adc-pin IO1 --adc-rate 10000] [--live] [--show]
                                     # gravação contínua (fw >= 0.4.0): lista de eventos com hora + PNG
+    uv run agent/analyzer.py presses captures/x.csv [--silence-ms 20] [--ref 1387.438,1544.998] [--png] [--zoom N] [--show]
+                                    # apertos reais (regra do STM32) e voltas comparadas com uma referência
     uv run agent/analyzer.py mcp                  # servidor MCP (stdio)
 Host: --host, ou S2LA_HOST, ou logic-s2.local. Token (rotas que alteram o ESP): ~/.config/s2la/token.
 """
@@ -507,6 +509,7 @@ def load_plot_data(path: Path) -> dict:
         dig_txt, adc_txt = split_combined(text)
         out["dig"] = parse_edges_csv(dig_txt)
         out["ms"] = float(out["dig"]["meta"].get("ms", 0) or 0)
+        out["bursts"] = parse_bursts(dig_txt)  # gravação: rajadas depois do buffer cheio (só resumo)
         if adc_txt:
             out["adc"] = parse_combined_adc(adc_txt)
     return out
@@ -538,6 +541,14 @@ def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = "",
         pins = [p for p in pins if p]
         for i, pin in enumerate(pins):
             rows = [(c / hz * 1e3, lv) for c, p, lv in dig["rows"] if p == pin]
+            bursts = d.get("bursts") or []
+            if bursts and i == 0:  # resumo das rajadas: faixa cinza e o nível final no fim de cada uma
+                for b in bursts:
+                    b0, b1 = b["start_us"] / 1e3, (b["start_us"] + b["bounce_us"]) / 1e3
+                    if b1 >= t0 and b0 <= t1:
+                        ax.axvspan((b0 - o) * k, (max(b1, b0 + (t1 - t0) * 0.002) - o) * k, color="#999", alpha=0.35, lw=0)
+                    rows.append((b1, b["final_level"]))
+                rows.sort()
             t = np.array([r[0] for r in rows]); v = np.array([r[1] for r in rows])
             init = dig["initial"].get(pin, v[0] ^ 1 if len(v) else 0)
             m = (t >= t0) & (t <= t1) if len(t) else np.array([], bool)
@@ -861,20 +872,152 @@ def run_record(an: "Analyzer", s: int = 120, pins: str = "IO10", pull: str = "no
     out(f"{len(events)} eventos em {main_pin}: {n_press} apertos, {len(events) - n_press} solturas ({end.get('total_edges', end.get('edges'))} bordas, status {end.get('status')}); "
         f"pausas da varredura: {gaps['gaps_over_100us']} > 100 µs, {gaps['gaps_over_1ms']} > 1 ms, "
         f"máx {_br(int(end.get('max_gap_cycles', 0) or 0) / 240.0, 1)} µs")
-    for i, e in enumerate(events):
-        extra = " (só resumo: buffer cheio)" if e.get("only_summary") else ""
-        out(f"  #{i + 1} {e['wall']}  +{_br(e['start_us'] / 1e6, 3)} s  {e['kind']}: {e['transitions']} bordas, "
-            f"bounce {_br(e['bounce_us'])} µs, termina em {e['final_level']}{extra}")
+    # apertos reais: pino fica em 0 por >= 20 ms; instante = última descida antes do silêncio (regra do STM32)
+    groups = find_presses(text, main_pin, 20.0)
+    presses = [g for g in groups if g["kind"] == "aperto"]
+    n_noise = sum(g["kind"] == "ruído" for g in groups)
+    out(f"apertos reais (0 estável por >= 20 ms): {len(presses)}; grupos de ruído (voltam a 1 sem aperto): {n_noise}")
+    for i, g in enumerate(presses):
+        g["wall"] = f"{datetime.fromtimestamp(t_start + g['last_fall_us'] / 1e6):%H:%M:%S.%f}"[:-3]
+        prev = presses[i - 1]["last_fall_us"] if i else None
+        dt = f", {_br((g['last_fall_us'] - prev) / 1000, 3)} ms depois do anterior" if prev else ""
+        out(f"  aperto {i + 1}: {g['wall']}  ({g['edges']} bordas no grupo, {_br(g['dur_ms'], 1)} ms de bounce/ruído{dt})")
     png = None
-    if events or parsed["rows"]:
+    if presses:
+        png = plot_presses_png(path, groups, CAPTURE_DIR / f"{path.stem}.png",
+                               title=f"Gravação {tag}: {main_pin}, {datetime.fromtimestamp(t_start):%H:%M:%S}")
+    elif events or parsed["rows"]:
         png = plot_record_png(path, [e for e in events if not e.get("only_summary")],
                               CAPTURE_DIR / f"{path.stem}.png",
                               f"Gravação {tag}: {main_pin}, {datetime.fromtimestamp(t_start):%H:%M:%S}")
         out(f"CSV: {path}\ngráfico: {png}")
         if show:
             show_png([png])
-    return {"fw": fw, "csv_local": str(path), "png": str(png) if png else None, "events": events, "presses": n_press, "end": end,
+    return {"fw": fw, "csv_local": str(path), "png": str(png) if png else None, "events": events, "presses": n_press,
+            "real_presses": [{k: g[k] for k in ("wall", "last_fall_us", "edges", "dur_ms")} for g in presses], "end": end,
             "start": datetime.fromtimestamp(t_start).isoformat(timespec="seconds")}
+
+
+# ---------------------------------------------------------------------------------------------------
+# Apertos reais e voltas (mesma regra do cronômetro do STM32: instante = última borda de descida antes
+# de silence_ms sem bordas)
+
+def find_presses(text: str, pin: str = "IO10", silence_ms: float = 20.0) -> list[dict]:
+    """Agrupa as bordas (e as rajadas resumidas depois do buffer cheio) em grupos separados por silence_ms
+    sem bordas. Cada grupo: instante da última descida (regra do STM32), nível em que fica depois e tipo:
+    "aperto" (fica em 0, estável por >= silence_ms), "soltura" (volta a 1 logo depois de um aperto) ou
+    "ruído" (rajadas que voltam a 1 sem aperto, ex.: 120 Hz do dedo encostado)."""
+    dig_txt, _ = split_combined(text)
+    parsed = parse_edges_csv(dig_txt)
+    hz = float(parsed["meta"].get("cpu_hz", 240_000_000))
+    items = [(c / hz * 1e6, c / hz * 1e6, lv, 1, False) for c, p, lv in parsed["rows"] if p == pin]
+    for b in parse_bursts(dig_txt):  # (início, fim, nível final, bordas, resumida)
+        items.append((b["start_us"], b["start_us"] + b["bounce_us"], b["final_level"], b["transitions"], True))
+    items.sort(key=lambda x: x[0])
+    groups = []
+    for t0, t1, lv, n, summ in items:
+        # última descida: exata para borda guardada; numa rajada resumida, o fim dela (se termina em 0) ou
+        # aproximada pelo fim (termina em 1 com >= 2 bordas: a última descida está logo antes)
+        lf = t1 if lv == 0 else (t1 if summ and n >= 2 else None)
+        approx = summ and lv == 1
+        if groups and t0 - groups[-1]["end_us"] < silence_ms * 1000:
+            g = groups[-1]
+            g["end_us"] = max(g["end_us"], t1); g["edges"] += n; g["final_level"] = lv; g["summary"] |= summ
+            if lf is not None:
+                g["last_fall_us"], g["approx"] = lf, approx
+        else:
+            groups.append({"start_us": t0, "end_us": t1, "edges": n, "final_level": lv, "summary": summ,
+                           "last_fall_us": lf, "approx": approx})
+    prev_press = False
+    for g in groups:
+        if g["final_level"] == 0:
+            g["kind"] = "aperto"
+        else:
+            g["kind"] = "soltura" if prev_press else "ruído"
+        prev_press = g["kind"] == "aperto"
+        g["dur_ms"] = round((g["end_us"] - g["start_us"]) / 1000, 3)
+    return groups
+
+
+def match_laps(groups: list[dict], ref_ms: list[float], tol: float = 0.02) -> list[dict]:
+    """Casa cada volta de referência (ex.: as do STM32, em ordem) com o par de eventos (com descida)
+    consecutivos cuja diferença mais se aproxima, avançando no tempo. tol: erro relativo máximo."""
+    ev = [g for g in groups if g.get("last_fall_us") is not None]
+    out, j = [], 0
+    for r in ref_ms:
+        best = None
+        for a in range(j, len(ev) - 1):
+            for b in range(a + 1, min(a + 4, len(ev))):
+                lap = (ev[b]["last_fall_us"] - ev[a]["last_fall_us"]) / 1000
+                err = abs(lap - r) / r
+                # prefere aperto -> aperto: cada ponta que não é aperto custa 0,2% (os relógios diferem ~0,1%)
+                score = err + 0.002 * ((ev[a]["kind"] != "aperto") + (ev[b]["kind"] != "aperto"))
+                if err <= tol and (best is None or score < best[0]):
+                    best = (score, a, b, lap)
+        if best:
+            _, a, b, lap = best
+            out.append({"ref_ms": r, "lap_ms": round(lap, 3), "diff_us": round((lap - r) * 1000, 1),
+                        "start": ev[a], "stop": ev[b], "approx": ev[a]["approx"] or ev[b]["approx"]})
+            j = b
+        else:
+            out.append({"ref_ms": r, "lap_ms": None, "diff_us": None, "start": None, "stop": None, "approx": False})
+    ok = [m for m in out if m["lap_ms"] and not m["approx"]]
+    if len(ok) >= 2:  # razão de relógio (ref/analisador) por mínimos quadrados, e o resíduo
+        k = sum(m["ref_ms"] * m["lap_ms"] for m in ok) / sum(m["lap_ms"] ** 2 for m in ok)
+        for m in out:
+            if m["lap_ms"]:
+                m["resid_us"] = round((m["lap_ms"] * k - m["ref_ms"]) * 1000, 1)
+        out_k = {"clock_ratio": k, "clock_ppm": round((k - 1) * 1e6)}
+        for m in out:
+            m.update(out_k)
+    return out
+
+
+def plot_presses_png(path: Path, groups: list[dict], out: Path, zoom: int | None = None, title: str = "") -> Path:
+    """PNG 9x9: linha do tempo dos apertos (numerados) + zoom num aperto com o analógico (janela do ADC)
+    + zoom do bounce em µs."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    d = load_plot_data(path)
+    presses = [g for g in groups if g["kind"] == "aperto"]
+    fig, axs = plt.subplots(3, 1, figsize=(9, 9), dpi=110, height_ratios=[1.2, 1, 1])
+    if presses:
+        lo = presses[0]["start_us"] / 1e3 - 1000
+        hi = max(g["end_us"] for g in groups) / 1e3 + 1000
+        plot_panel(axs[0], d, lo, hi, f"{len(presses)} apertos (0 estável por >= 20 ms, linhas vermelhas); faixas cheias/cinza = rajadas de ruído")
+        axs[0].ticklabel_format(axis="x", useOffset=False, style="plain")
+        for i, g in enumerate(presses):
+            x = g["last_fall_us"] / 1e3
+            axs[0].axvline(x, color="#a33", lw=0.6)
+            axs[0].text(x, 1.1, f"{i + 1}", color="#a33", fontsize=7, ha="center")
+    # zoom: o aperto pedido, ou o 1o com janela analógica
+    adc_t = []
+    if d["adc"] and d["adc"]["us"]:
+        adc_t = d["adc"]["us"]
+    def has_adc(g):
+        return any(abs(t - g["last_fall_us"]) < 5000 for t in adc_t[:: max(1, len(adc_t) // 20000)]) if adc_t else False
+    pick = None
+    if presses:
+        if zoom and 1 <= zoom <= len(presses):
+            pick = zoom - 1
+        else:
+            pick = next((i for i, g in enumerate(presses) if has_adc(g)), 0)
+        g = presses[pick]
+        x = g["last_fall_us"] / 1e3
+        plot_panel(axs[1], d, x - 20, x + 80, f"aperto {pick + 1}: 20 ms antes, 80 ms depois", origin_ms=x)
+        s0 = g["start_us"] / 1e3
+        span = max(0.05, (g["last_fall_us"] - g["start_us"]) / 1e3)
+        plot_panel(axs[2], d, s0 - 0.2 * span - 0.01, x + 0.2 * span + 0.01,
+                   f"aperto {pick + 1}: bounce ({g['edges']} borda{'' if g['edges'] == 1 else 's'}, última descida em {_br((g['last_fall_us'] - g['start_us']))} µs)",
+                   origin_ms=s0)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    out = Path(out)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
 
 
 def run_mcp():
@@ -1010,6 +1153,9 @@ def main():
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pre", type=int, default=100)
     p.add_argument("--tag", default="adc")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
+    p = sub.add_parser("presses"); p.add_argument("csv"); p.add_argument("--pin", default="IO10")
+    p.add_argument("--silence-ms", type=float, default=20.0); p.add_argument("--ref", help="voltas de referência em ms, separadas por vírgula")
+    p.add_argument("--png", action="store_true"); p.add_argument("--zoom", type=int); p.add_argument("--show", action="store_true")
     p = sub.add_parser("record"); p.add_argument("--s", type=int, default=120); p.add_argument("--pins", default="IO10")
     p.add_argument("--pull", default="none"); p.add_argument("--settle-ms", type=float, default=5.0)
     p.add_argument("--adc-pin"); p.add_argument("--adc-rate", type=int, default=10000)
@@ -1048,6 +1194,36 @@ def main():
         print(out)
         if a.show:
             show_png([out])
+        return
+    if a.cmd == "presses":
+        path = resolve_csv(a.csv)
+        groups = find_presses(path.read_text(), a.pin, a.silence_ms)
+        pr = [g for g in groups if g["kind"] == "aperto"]
+        cnt = {k: sum(g["kind"] == k for g in groups) for k in ("aperto", "soltura", "ruído")}
+        print(f"{len(groups)} grupos separados por {_br(a.silence_ms, 0)} ms de silêncio: {cnt['aperto']} apertos, "
+              f"{cnt['soltura']} solturas, {cnt['ruído']} de ruído")
+        for i, g in enumerate(pr):
+            print(f"  aperto {i + 1:2d}: {_br(g['last_fall_us'] / 1e6, 6)} s  ({g['edges']} bordas no grupo, "
+                  f"{_br(g['dur_ms'], 1)} ms{', resumido' if g['summary'] else ''})")
+        if a.ref:
+            ref = [float(x) for x in a.ref.split(",") if x.strip()]
+            ms = match_laps(groups, ref)
+            print("volta | referência (ms) | analisador (ms) | diferença (µs) | resíduo após razão de relógio (µs) | eventos")
+            for i, m in enumerate(ms):
+                if m["lap_ms"] is None:
+                    print(f"{i + 1} | {_br(m['ref_ms'], 3)} | não achada | | |")
+                    continue
+                kinds = f"{m['start']['kind']}->{m['stop']['kind']}" + (" (aprox.)" if m["approx"] else "")
+                print(f"{i + 1} | {_br(m['ref_ms'], 3)} | {_br(m['lap_ms'], 3)} | {_br(m['diff_us'], 1)} | "
+                      f"{_br(m.get('resid_us', 0), 1)} | {kinds}")
+            if ms and "clock_ppm" in ms[0]:
+                print(f"razão de relógio referência/analisador: {ms[0]['clock_ratio']:.6f} ({ms[0]['clock_ppm']:+d} ppm)")
+        if a.png:
+            png = plot_presses_png(path, groups, CAPTURE_DIR / f"{path.stem}_apertos.png", a.zoom,
+                                   f"{path.stem}: apertos em {a.pin}")
+            print(f"gráfico: {png}")
+            if a.show:
+                show_png([png])
         return
     if a.cmd == "analyze-adc":
         print(json.dumps(analyze_adc(parse_adc_csv(Path(a.csv).read_text())), indent=1))

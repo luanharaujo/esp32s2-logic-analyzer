@@ -293,6 +293,16 @@ check("record: eventos ao vivo", sum("evento" in x and "às" in x for x in lines
 check("record: PNG", rr["png"] and Path(rr["png"]).exists() and plt.imread(rr["png"]).shape[:2] == (990, 990), rr["png"])
 ra = analyzer.analyze_any(Path(rr["csv_local"]).read_text())
 check("record: ADC por evento sem tom", "tone_60hz_mv" not in ra["adc"] and ra["adc"]["samples"] == 1000, ra["adc"])
+check("record: 4 apertos reais", len(rr["real_presses"]) == 4, rr["real_presses"])
+gr = analyzer.find_presses(Path(rr["csv_local"]).read_text())
+pr = [g for g in gr if g["kind"] == "aperto"]
+check("presses: última descida (regra do STM32)", abs(pr[0]["last_fall_us"] - 500009) < 0.01, pr[0])
+ml = analyzer.match_laps(gr, [700.0 * 1.0015, 600.0 * 1.0015, 5000.0])
+check("presses: voltas e razão de relógio", ml[0]["lap_ms"] == 700.0 and abs(ml[1]["lap_ms"] - 600.05) < 0.01
+      and abs(ml[0]["clock_ppm"] - 1500) < 100 and ml[2]["lap_ms"] is None, ml)
+png2 = analyzer.plot_presses_png(Path(rr["csv_local"]), gr, ROOT / "captures/_teste_apertos.png")
+check("presses: PNG", plt.imread(png2).shape[:2] == (990, 990))
+png2.unlink()
 Path(rr["csv_local"]).unlink(); Path(rr["png"]).unlink()
 state["fw"] = "0.3.4"
 try:
