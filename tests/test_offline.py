@@ -21,8 +21,32 @@ state = {"boot": 1, "fw": "0.2.0", "t0": time.time(), "gen": None}
 PATTERN = [3, 5, 12, 8, 40, 25, 20000, 4, 6, 15, 10, 60]
 
 
+def fake_combined(q: dict, ms: int) -> str:
+    """Captura combinada: IO10 digital (cai em 0, sobe em 300 µs, cai de vez em 600 µs) e o mesmo nó no
+    ADC (IO1, 20 kHz) desde 1 ms antes do trigger, com as amostras atrasadas até 1 período."""
+    lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall tmode=poll pins=IO10",
+             "# initial IO10=1", "cycles,pin,level", "0,IO10,0", f"{300 * 240},IO10,1", f"{600 * 240},IO10,0",
+             "# end edges=3 overflow=0 max_gap_cycles=22 status=ok loops=1 max_edges=1 buf=psram wait_ms=10 err="]
+    rate = int(q["adc_rate"][0]); per = 96 * (2_500_000 // rate)
+    lines.append(f"# adc_samples v1 pin={q['adc_pin'][0]} gpio=1 header_pin=10 unit=1 ch=0 atten_range_mv=2500 rate={rate} "
+                 f"rate_real={2_500_000 / (2_500_000 // rate):.1f} bits=12 cal=nominal t0=digital chain=3070")
+    lines.append("cycles,raw,mv")
+    n = 0
+    c = -1000 * 240 + 77
+    while c <= ms * 1000 * 240:
+        us = c / 240
+        lv = 0 if (0 <= us < 300 or us >= 600) else 1
+        raw = 4095 if lv else 30
+        lines.append(f"{c},{raw},{raw * 2500 // 4095}")
+        c += per; n += 1
+    lines.append(f"# adc_end samples={n} wanted={n} chain=3070 invalid=0 period_cycles={per} first_cycles={-1000 * 240 + 77} slice_ms=50")
+    return "\n".join(lines) + "\n"
+
+
 def fake_csv(q: dict) -> str:
     ms = int(q.get("ms", ["100"])[0])
+    if q.get("adc_pin"):
+        return fake_combined(q, ms)
     if state.get("bounce") and q.get("pins", [""])[0] == "IO10":  # rajada do gerador, borda a borda
         state["bounce"] = False
         lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall pins=IO10",
@@ -176,6 +200,19 @@ try:
     an.adc(pin="IO11"); check("adc: ADC2 recusado", False)
 except analyzer.AnalyzerError as e:
     check("adc: ADC2 recusado", "ADC2" in str(e), e)
+cb = an.capture(ms=20, trigger="IO10", edge="fall", adc_pin="IO1", adc_rate=20000, tag="teste_comb")
+check("combinada: digital intacto", cb["pins"]["IO10"]["events"][0]["transitions"] == 3, cb["pins"]["IO10"])
+cmp_ = cb.get("compare", {})
+check("combinada: 3 cruzamentos no ADC", cmp_.get("adc_crossings") == 3, cmp_)
+check("combinada: atraso < 1 amostra", 0 <= cmp_.get("first_lag_us", -1) <= 50, cmp_)
+check("combinada: pré-trigger negativo", cmp_.get("adc_from_us", 0) < -900, cmp_)
+check("combinada: duração igual", abs(cmp_.get("adc_span_us", 0) - cmp_.get("digital_span_us", 0)) <= 50, cmp_)
+check("combinada: taxa real", cb["adc"]["rate_sps"] == 20000.0, cb["adc"])
+comb_path = Path(cb["csv_local"])
+off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(comb_path)],
+                                capture_output=True, text=True).stdout)
+check("analyze offline combinada", off["compare"]["adc_crossings"] == 3, off.get("compare"))
+comb_path.unlink()
 st = an.selftest()
 check("selftest bounce", st["bounce"]["ok"], st["bounce"])
 check("selftest square", st["square"]["ok"], st["square"])

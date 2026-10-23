@@ -14,6 +14,7 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py channels | levels [--pull up]
     uv run agent/analyzer.py capture [--ms 100] [--trigger IO10 --edge fall --timeout-ms 10000] [--pull up]
                                      [--pins IO10,IO11] [--settle-us 5000]   # salva CSV em captures/ e resume
+                                     [--adc-pin IO1 --adc-rate 20000 --adc-atten 11]  # + analógico junto
     uv run agent/analyzer.py analyze captures/x.csv [--settle-us 5000]       # offline
     uv run agent/analyzer.py gen IO10 --hz 1000 [--duty 50] | gen IO10 --hz 0  # gerador de teste no canal
     uv run agent/analyzer.py gen IO10 --mode bounce [--delay-ms 500]          # rajada de bounce de teste
@@ -169,10 +170,14 @@ class Analyzer:
         return out
 
     def capture_csv(self, ms: int = 100, trigger: str | None = None, edge: str = "any", timeout_ms: int = 10000,
-                    pull: str = "none", pins: str | None = None, tmode: str = "poll") -> str:
+                    pull: str = "none", pins: str | None = None, tmode: str = "poll", adc_pin: str | None = None,
+                    adc_rate: int = 20000, adc_atten: str = "11") -> str:
         """Captura bordas nos canais (CSV gpio_edges v1, ciclos de 240 MHz). Com trigger, espera a borda até
-        timeout_ms e captura ms a partir dela."""
+        timeout_ms (até 300000) e captura ms a partir dela. adc_pin (IO1, IO2 ou IO10): amostra também esse
+        pino no ADC1, na mesma base de tempo (seção adc_samples depois do # end)."""
         q = {"ms": ms, "edge": edge, "timeout_ms": timeout_ms, "pull": pull, "tmode": tmode}
+        if adc_pin:
+            q.update(adc_pin=adc_pin, adc_rate=adc_rate, adc_atten=adc_atten)
         if trigger:
             q["trigger"] = trigger
         if pins:
@@ -201,7 +206,7 @@ class Analyzer:
     def capture(self, settle_us: float = 5000.0, tag: str = "capture", **kw) -> dict:
         text = self.capture_csv(**kw)
         path = save_capture(text, tag)
-        res = analyze(parse_edges_csv(text), settle_us)
+        res = analyze_any(text, settle_us)
         res["csv_local"] = str(path)
         return res
 
@@ -380,6 +385,72 @@ def analyze_adc(parsed: dict, hyst_mv: float = 200.0) -> dict:
     return out
 
 
+def split_combined(text: str) -> tuple[str, str | None]:
+    """CSV da captura combinada -> (parte gpio_edges, parte adc_samples ou None)."""
+    k = text.find("# adc_samples v1")
+    return (text, None) if k < 0 else (text[:k], text[k:])
+
+
+def parse_combined_adc(text: str) -> dict:
+    """Seção adc_samples da captura combinada (cycles,raw,mv desde o t0 digital) -> formato de parse_adc_csv."""
+    out = {"meta": {}, "end": {}, "us": [], "raw": [], "mv": [], "cycles": []}
+    for line in text.splitlines():
+        if line.startswith("# adc_samples"):
+            out["meta"] = dict(kv.split("=", 1) for kv in line.split()[3:] if "=" in kv)
+        elif line.startswith("# adc_end"):
+            out["end"] = dict(kv.split("=", 1) for kv in line.split()[2:] if "=" in kv)
+        elif line and line[0] in "-0123456789":
+            c, raw, mv = line.split(",")
+            out["cycles"].append(int(c)); out["raw"].append(int(raw)); out["mv"].append(int(mv))
+    out["us"] = [c / 240.0 for c in out["cycles"]]
+    m = out["meta"]
+    m["rate"] = m.get("rate_real", m.get("rate", "0"))
+    m.setdefault("range_mv", m.get("atten_range_mv", "0"))
+    return out
+
+
+def compare_dig_adc(dig: dict, adc_parsed: dict, pin: str, hyst_mv: float = 200.0) -> dict:
+    """Mesmo nó nas duas garras: bordas digitais do pino vs cruzamentos do meio da faixa no analógico."""
+    edges = [c / 240.0 for c, p, _ in dig["rows"] if p == pin]
+    mv, us = adc_parsed["mv"], adc_parsed["us"]
+    out = {"pin": pin, "digital_edges": len(edges)}
+    if not mv:
+        return out
+    out["adc_from_us"], out["adc_to_us"] = round(us[0], 2), round(us[-1], 2)
+    inside = [e for e in edges if us[0] <= e <= us[-1]]
+    out["digital_edges_in_adc_window"] = len(inside)
+    mid = (min(mv) + max(mv)) / 2
+    cross, hi = [], mv[0] > mid
+    if max(mv) - min(mv) > 2 * hyst_mv:
+        for k, v in enumerate(mv):
+            if hi and v < mid - hyst_mv / 2:
+                hi = False; cross.append(us[k])
+            elif not hi and v > mid + hyst_mv / 2:
+                hi = True; cross.append(us[k])
+    out["adc_crossings"] = len(cross)
+    if inside and cross:
+        out["first_digital_us"], out["first_adc_cross_us"] = round(inside[0], 2), round(cross[0], 2)
+        out["first_lag_us"] = round(cross[0] - inside[0], 2)
+        out["digital_span_us"] = round(inside[-1] - inside[0], 2)
+        out["adc_span_us"] = round(cross[-1] - cross[0], 2)
+    return out
+
+
+def analyze_any(text: str, settle_us: float = 5000.0, compare_pin: str | None = None) -> dict:
+    """analyze() da parte digital; se houver seção analógica, junta analyze_adc e a comparação."""
+    dig_txt, adc_txt = split_combined(text)
+    dig = parse_edges_csv(dig_txt)
+    res = analyze(dig, settle_us)
+    if adc_txt:
+        ap = parse_combined_adc(adc_txt)
+        a = analyze_adc(ap)
+        a["end"] = ap["end"]
+        res["adc"] = a
+        pin = compare_pin or (dig["meta"].get("trigger") if dig["meta"].get("trigger") not in (None, "none") else "IO10")
+        res["compare"] = compare_dig_adc(dig, ap, pin)
+    return res
+
+
 def save_capture(text: str, tag: str = "capture") -> Path:
     CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
     path = CAPTURE_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{tag}.csv"
@@ -419,16 +490,22 @@ def run_mcp():
 
     @mcp.tool()
     def capture(ms: int = 100, trigger: str = "", edge: str = "any", timeout_ms: int = 10000,
-                pull: str = "none", pins: str = "", settle_us: float = 5000.0, tmode: str = "poll") -> str:
+                pull: str = "none", pins: str = "", settle_us: float = 5000.0, tmode: str = "poll",
+                adc_pin: str = "", adc_rate: int = 20000, adc_atten: str = "11") -> str:
         """Captura bordas nos canais do analisador (resolução ~0,1 µs, janela de até 2000 ms).
         trigger: canal (ex. "IO10") cuja borda (edge: rise, fall, any) dispara a captura; vazio = agora.
         timeout_ms: quanto esperar pelo trigger. pull: up/down/none em todos os canais.
         pins: lista "IO10,IO11" (vazio = os 8). settle_us: silêncio que separa eventos (bounce).
         tmode: "poll" (padrão, latência ~0,1 µs; Wi-Fi pausa durante a espera) ou "isr" (~1-2 µs).
+        timeout_ms até 300000 (5 min).
+        adc_pin ("IO1", "IO2" ou "IO10"): grava também o analógico desse pino (ADC1 por DMA, adc_rate 611 a
+        83333/s, 12 bits, adc_atten "11" = 0 a ~2,5 V) na MESMA base de tempo das bordas, para comparar
+        as duas garras no mesmo nó. Cobre no máximo a cadeia de DMA (chain amostras, ~150 ms a 20 kHz).
         Devolve, por pino, os eventos (duração do bounce, transições, larguras de pulso), frequência
-        e duty de sinais periódicos, e o caminho do CSV salvo no Mac."""
+        e duty de sinais periódicos, o resumo analógico e a comparação (se adc_pin), e o caminho do CSV."""
         return json.dumps(an.capture(settle_us=settle_us, ms=ms, trigger=trigger or None, edge=edge,
-                                     timeout_ms=timeout_ms, pull=pull, pins=pins or None, tmode=tmode),
+                                     timeout_ms=timeout_ms, pull=pull, pins=pins or None, tmode=tmode,
+                                     adc_pin=adc_pin or None, adc_rate=adc_rate, adc_atten=adc_atten),
                           ensure_ascii=False)
 
     @mcp.tool()
@@ -475,6 +552,8 @@ def main():
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pull", default="none")
     p.add_argument("--pins"); p.add_argument("--settle-us", type=float, default=5000); p.add_argument("--tag", default="capture")
     p.add_argument("--tmode", default="poll", choices=["poll", "isr"])
+    p.add_argument("--adc-pin", help="IO1, IO2 ou IO10: analógico junto, mesma base de tempo")
+    p.add_argument("--adc-rate", type=int, default=20000); p.add_argument("--adc-atten", default="11", choices=["0", "2.5", "6", "11"])
     p = sub.add_parser("analyze"); p.add_argument("csv"); p.add_argument("--settle-us", type=float, default=5000)
     p = sub.add_parser("gen"); p.add_argument("pin"); p.add_argument("--hz", type=int, default=1000); p.add_argument("--duty", type=int, default=50)
     p.add_argument("--mode", default="square", choices=["square", "bounce"]); p.add_argument("--delay-ms", type=int, default=500)
@@ -490,7 +569,7 @@ def main():
     if a.cmd == "mcp":
         return run_mcp()
     if a.cmd == "analyze":
-        print(json.dumps(analyze(parse_edges_csv(Path(a.csv).read_text()), a.settle_us), indent=1))
+        print(json.dumps(analyze_any(Path(a.csv).read_text(), a.settle_us), indent=1))
         return
     if a.cmd == "analyze-adc":
         print(json.dumps(analyze_adc(parse_adc_csv(Path(a.csv).read_text())), indent=1))
@@ -519,7 +598,8 @@ def main():
             sys.exit(0 if r["ok"] else 1)
         elif a.cmd == "capture":
             print(json.dumps(an.capture(settle_us=a.settle_us, tag=a.tag, ms=a.ms, trigger=a.trigger, edge=a.edge,
-                                        timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode),
+                                        timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode,
+                                        adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten),
                              indent=1, ensure_ascii=False))
         elif a.cmd == "adc":
             print(json.dumps(an.adc(tag=a.tag, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, trig_mv=a.trig_mv,
