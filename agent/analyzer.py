@@ -408,9 +408,14 @@ def parse_combined_adc(text: str) -> dict:
             c, raw, mv = line.split(",")
             out["cycles"].append(int(c)); out["raw"].append(int(raw)); out["mv"].append(int(mv))
     out["us"] = [c / 240.0 for c in out["cycles"]]
-    m = out["meta"]
+    m, e = out["meta"], out["end"]
     m["rate"] = m.get("rate_real", m.get("rate", "0"))
+    if m["rate"] in ("0", "") and e.get("period_cycles"):  # cabeçalho incompleto (fw 0.3.1): taxa pelo período
+        m["rate"] = str(240e6 / int(e["period_cycles"]))
     m.setdefault("range_mv", m.get("atten_range_mv", "0"))
+    m.setdefault("atten", {"750": "0", "1050": "2.5", "1300": "6", "2500": "11"}.get(m["range_mv"]))
+    if e:
+        e.setdefault("status", "ok" if e.get("samples") == e.get("wanted") else "incompleto")
     return out
 
 
@@ -627,14 +632,23 @@ def run_series(an: "Analyzer", n: int, ms: int = 1500, trigger: str = "IO10", ed
                adc_rate: int = 20000, adc_atten: str = "11", show: bool = False, out=print) -> dict:
     """N capturas com trigger em sequência (teste de bancada). Uma linha por captura e, no fim, um PNG
     comparativo por grupo (zoom comum no 1o evento)."""
-    fw = an.status().get("fw", "")
-    if _fw_tuple(fw) < (0, 3, 1):
-        if timeout_ms > 60000:
-            out(f"firmware {fw}: timeout limitado a 60000 ms (5 min só a partir do 0.3.1)")
-        timeout_ms = min(timeout_ms, 60000)
-        if adc_pin:
-            out(f"firmware {fw}: sem captura analógica junto (precisa do 0.3.1); seguindo só com o digital")
-            adc_pin = None
+    want_timeout, want_adc = timeout_ms, adc_pin
+    st = an.status()
+    fw, boot = st.get("fw", ""), st.get("boot")
+
+    def adapt(fw: str):
+        """Limites do firmware que está rodando AGORA (pode ter mudado por rollback de OTA)."""
+        t, a = want_timeout, want_adc
+        if _fw_tuple(fw) < (0, 3, 1):
+            if t > 60000:
+                out(f"firmware {fw}: timeout limitado a 60000 ms (5 min só a partir do 0.3.1)")
+            t = min(t, 60000)
+            if a:
+                out(f"firmware {fw}: sem captura analógica junto (precisa do 0.3.1); seguindo só com o digital")
+                a = None
+        return t, a
+
+    timeout_ms, adc_pin = adapt(fw)
     labels = []
     if groups:
         for g in groups.split(","):
@@ -644,6 +658,25 @@ def run_series(an: "Analyzer", n: int, ms: int = 1500, trigger: str = "IO10", ed
     caps = []
     for i in range(n):
         lab = labels[i]
+        if i:
+            # confere se o ESP reiniciou (panic, rollback de OTA) antes de armar de novo; espera ele voltar
+            st = None
+            for _ in range(30):
+                try:
+                    st = an.status()
+                    break
+                except AnalyzerError:
+                    time.sleep(2)
+            if st is None:
+                out("  ESP não respondeu em 60 s; série interrompida")
+                break
+            if st.get("boot") != boot:
+                out(f"  ATENÇÃO: o ESP reiniciou (reset={st.get('reset_reason')}, detalhe={st.get('reset_detail')!r}, "
+                    f"panic={st.get('panic', '')!r}, fw={st.get('fw')})")
+                boot = st.get("boot")
+                if st.get("fw") != fw:
+                    fw = st.get("fw", "")
+                    timeout_ms, adc_pin = adapt(fw)
         name = f"{tag}_{lab}_{i + 1}" if lab else f"{tag}_{i + 1}"
         out(f"[{i + 1}/{n}] {('grupo ' + lab + ': ') if lab else ''}armado, esperando borda {edge} em {trigger} "
             f"(até {timeout_ms // 1000} s)")
@@ -677,7 +710,7 @@ def run_series(an: "Analyzer", n: int, ms: int = 1500, trigger: str = "IO10", ed
         out(f"gráfico: {png}")
     if show and pngs:
         show_png(pngs)
-    return {"fw": fw, "timeout_ms": timeout_ms, "captures": caps, "png": [str(p) for p in pngs]}
+    return {"fw": fw, "timeout_ms": timeout_ms, "adc_pin": adc_pin, "captures": caps, "png": [str(p) for p in pngs]}
 
 
 def series_pngs(caps: list, tag: str) -> list[Path]:

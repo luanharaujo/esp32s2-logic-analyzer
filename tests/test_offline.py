@@ -114,7 +114,12 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path); q = parse_qs(u.query)
         if u.path == "/status":
-            self.reply(200, json.dumps({"ok": True, "fw": state["fw"], "boot": state["boot"], "partition": "ota_1",
+            if state.get("reboot_on_status"):  # simula panic + rollback durante a série
+                state["reboot_on_status"] -= 1
+                if state["reboot_on_status"] == 0:
+                    state.update(boot=state["boot"] + 1, fw="0.2.3")
+            self.reply(200, json.dumps({"ok": True, "fw": state["fw"], "boot": state["boot"], "reset_reason": "panic",
+                                        "panic": "assert failed", "partition": "ota_1",
                                         "uptime_s": int(time.time() - state["t0"]), "reset_detail": "",
                                         "ota_pending_verify": False}))
         elif u.path == "/capture":
@@ -209,6 +214,10 @@ check("combinada: atraso < 1 amostra", 0 <= cmp_.get("first_lag_us", -1) <= 50, 
 check("combinada: pré-trigger negativo", cmp_.get("adc_from_us", 0) < -900, cmp_)
 check("combinada: duração igual", abs(cmp_.get("adc_span_us", 0) - cmp_.get("digital_span_us", 0)) <= 50, cmp_)
 check("combinada: taxa real", cb["adc"]["rate_sps"] == 20000.0, cb["adc"])
+check("combinada: atenuação e status", cb["adc"]["atten_db"] == "11" and cb["adc"]["status"] == "ok", cb["adc"])
+old = analyzer.parse_combined_adc("# adc_samples v1 pin=IO1 t0=digital\ncycles,raw,mv\n100,4095,2500\n"
+                                  "# adc_end samples=1 wanted=1 chain=1280 invalid=0 period_cycles=24000 first_cycles=100 slice_ms=64\n")
+check("combinada: cabeçalho do 0.3.1 (taxa pelo período)", abs(float(old["meta"]["rate"]) - 10000) < 1e-6, old["meta"])
 comb_path = Path(cb["csv_local"])
 off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(comb_path)],
                                 capture_output=True, text=True).stdout)
@@ -226,6 +235,19 @@ cli = subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "plot"
 check("plot CLI", cli.returncode == 0 and (ROOT / "captures/_teste_cli.png").exists(), cli.stderr[-300:])
 (ROOT / "captures/_teste_cli.png").unlink(missing_ok=True)
 comb_path.unlink()
+# series: começa no 0.3.4 com ADC; o ESP "reinicia" no 0.2.3 antes da 2a captura -> avisa e adapta
+state.update(fw="0.3.4", reboot_on_status=2)
+lines = []
+sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="teste_serie_rb",
+                         adc_pin="IO1", out=lines.append)
+check("series: detecta reinício", any("reiniciou" in x for x in lines), lines)
+check("series: adapta ao fw do rollback", sr["timeout_ms"] == 60000 and sr["adc_pin"] is None
+      and state["last_capture_q"]["timeout_ms"] == ["60000"], (sr["timeout_ms"], state["last_capture_q"]))
+for c in sr["captures"]:
+    Path(c["csv"]).unlink()
+for x in sr["png"]:
+    Path(x).unlink()
+state["fw"] = "0.2.0"
 # series: firmware 0.2.0 -> timeout limitado a 60 s e sem ADC; 2 grupos de 1
 lines = []
 state["bounce"] = False
