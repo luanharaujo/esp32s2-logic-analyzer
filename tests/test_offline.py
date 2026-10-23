@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["mcp>=1.2,<2"]
+# dependencies = ["mcp>=1.2,<2", "matplotlib>=3.8"]
 # ///
 """Testes sem hardware: um ESP falso (HTTP local) responde como o firmware; confere CLI, análise e OTA.
 Uso: uv run tests/test_offline.py"""
@@ -118,6 +118,7 @@ class H(BaseHTTPRequestHandler):
                                         "uptime_s": int(time.time() - state["t0"]), "reset_detail": "",
                                         "ota_pending_verify": False}))
         elif u.path == "/capture":
+            state["last_capture_q"] = q
             self.reply(200, fake_csv(q), "text/csv")
         elif u.path == "/adc":
             body = fake_adc(q)
@@ -212,7 +213,33 @@ comb_path = Path(cb["csv_local"])
 off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(comb_path)],
                                 capture_output=True, text=True).stdout)
 check("analyze offline combinada", off["compare"]["adc_crossings"] == 3, off.get("compare"))
+# plot: painéis manuais (combinada, com zoom em µs) e automático; PNG quadrado 990x990
+import matplotlib.pyplot as plt  # noqa: E402
+png = analyzer.plot_png([analyzer.parse_panel(f"{comb_path}|-1|20|combinada"),
+                         analyzer.parse_panel(f"{comb_path}|-0.05|0.7|zoom")], ROOT / "captures/_teste_plot.png", "teste")
+check("plot: PNG 990x990", plt.imread(png).shape[:2] == (990, 990), plt.imread(png).shape)
+png.unlink()
+auto = analyzer.auto_panels(comb_path)
+check("plot --auto: 2 painéis, zoom no 1º evento", len(auto) == 2 and auto[1][1] < 0 < auto[1][2] < 1, auto)
+cli = subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "plot", "--auto", str(comb_path), "-o",
+                      str(ROOT / "captures/_teste_cli.png")], capture_output=True, text=True)
+check("plot CLI", cli.returncode == 0 and (ROOT / "captures/_teste_cli.png").exists(), cli.stderr[-300:])
+(ROOT / "captures/_teste_cli.png").unlink(missing_ok=True)
 comb_path.unlink()
+# series: firmware 0.2.0 -> timeout limitado a 60 s e sem ADC; 2 grupos de 1
+lines = []
+state["bounce"] = False
+sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="teste_serie",
+                         groups="caneta:1,dedo:1", adc_pin="IO1", out=lines.append)
+check("series: timeout limitado no fw antigo", sr["timeout_ms"] == 60000 and state["last_capture_q"]["timeout_ms"] == ["60000"], sr)
+check("series: sem ADC no fw antigo", "adc_pin" not in state["last_capture_q"], state["last_capture_q"])
+check("series: 2 capturas com evento", [c["events"] for c in sr["captures"]] == [1, 1], sr["captures"])
+check("series: 1 PNG por grupo", len(sr["png"]) == 2 and all(Path(x).exists() for x in sr["png"]), sr["png"])
+check("series: linha por captura", sum("bordas" in x for x in lines) == 2, lines)
+for c in sr["captures"]:
+    Path(c["csv"]).unlink()
+for x in sr["png"]:
+    Path(x).unlink()
 st = an.selftest()
 check("selftest bounce", st["bounce"]["ok"], st["bounce"])
 check("selftest square", st["square"]["ok"], st["square"])

@@ -2,6 +2,7 @@
 # requires-python = ">=3.11"
 # dependencies = [
 #   "mcp>=1.2,<2",
+#   "matplotlib>=3.8",
 # ]
 # ///
 """Analisador lógico pela rede (Wi-Fi Devboard ESP32-S2, firmware em firmware/), para agentes.
@@ -22,6 +23,10 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py adc [--pin IO10] [--ms 100] [--rate 83333] [--atten 11]
                                  [--trig-mv 1650 --edge fall --timeout-ms 10000 --pre 100]  # analógico (ADC1)
     uv run agent/analyzer.py analyze-adc captures/x_adc.csv                    # offline
+    uv run agent/analyzer.py plot "arq.csv|t0_ms|t1_ms|título" [...] [-o x.png] [--title T] [--show]  # PNG 9x9
+    uv run agent/analyzer.py plot --auto arq.csv [--show]                     # janela inteira + zoom no 1º evento
+    uv run agent/analyzer.py series --n 9 --ms 1500 --trigger IO10 --edge fall --timeout-ms 300000 --gap-s 2
+                                    --tag t2 [--groups caneta:3,chassi:3,dedo:3] [--adc-pin IO1] [--show]
     uv run agent/analyzer.py mcp                  # servidor MCP (stdio)
 Host: --host, ou S2LA_HOST, ou logic-s2.local. Token (rotas que alteram o ESP): ~/.config/s2la/token.
 """
@@ -458,6 +463,253 @@ def save_capture(text: str, tag: str = "capture") -> Path:
     return path
 
 
+# ---------------------------------------------------------------------------------------------------
+# Gráficos (PNG quadrado) e séries de capturas de bancada
+
+PLOT_DIGITAL_COLOR = "#1f5fa8"
+PLOT_ADC_COLOR = "#d9822b"
+PREVIEW_BOUNDS = "{0, 30, 1040, 1070}"  # canto superior esquerdo da tela principal (2080x1170 pontos)
+
+
+def _br(x: float, nd: int = 1) -> str:
+    """Número com vírgula decimal."""
+    return f"{x:.{nd}f}".replace(".", ",")
+
+
+def resolve_csv(name: str) -> Path:
+    """Caminho do CSV: como veio, ou dentro de captures/."""
+    p = Path(name).expanduser()
+    if p.exists():
+        return p
+    q = CAPTURE_DIR / name
+    if q.exists():
+        return q
+    raise AnalyzerError(f"CSV não encontrado: {name}")
+
+
+def load_plot_data(path: Path) -> dict:
+    """Lê um CSV gpio_edges (com ou sem a seção analógica) ou adc_samples. Tempos em ms desde o t0."""
+    text = Path(path).read_text()
+    out = {"path": Path(path), "dig": None, "adc": None, "ms": None}
+    if text.lstrip().startswith("# adc_samples"):
+        out["adc"] = parse_adc_csv(text)
+    else:
+        dig_txt, adc_txt = split_combined(text)
+        out["dig"] = parse_edges_csv(dig_txt)
+        out["ms"] = float(out["dig"]["meta"].get("ms", 0) or 0)
+        if adc_txt:
+            out["adc"] = parse_combined_adc(adc_txt)
+    return out
+
+
+def _data_range_ms(d: dict) -> tuple[float, float]:
+    lo, hi = 0.0, d["ms"] or 0.0
+    if d["dig"] and d["dig"]["rows"]:
+        hz = float(d["dig"]["meta"].get("cpu_hz", 240_000_000))
+        hi = max(hi, d["dig"]["rows"][-1][0] / hz * 1e3)
+    if d["adc"] and d["adc"]["us"]:
+        lo, hi = min(lo, d["adc"]["us"][0] / 1e3), max(hi, d["adc"]["us"][-1] / 1e3)
+    return lo, (hi if hi > lo else lo + 1.0)
+
+
+def plot_panel(ax, d: dict, t0: float | None, t1: float | None, title: str = ""):
+    """Um painel: degraus do digital (um por pino, empilhados) e o analógico em mV no eixo da direita."""
+    import numpy as np
+    lo, hi = _data_range_ms(d)
+    t0 = lo if t0 is None else t0
+    t1 = hi if t1 is None else t1
+    k = 1000.0 if t1 - t0 < 1.0 else 1.0  # janela < 1 ms: eixo em µs
+    n_edges = 0
+    if d["dig"]:
+        dig = d["dig"]
+        hz = float(dig["meta"].get("cpu_hz", 240_000_000))
+        pins = dig["meta"].get("pins", "").split(",") if dig["meta"].get("pins") else sorted({r[1] for r in dig["rows"]})
+        pins = [p for p in pins if p]
+        for i, pin in enumerate(pins):
+            rows = [(c / hz * 1e3, lv) for c, p, lv in dig["rows"] if p == pin]
+            t = np.array([r[0] for r in rows]); v = np.array([r[1] for r in rows])
+            init = dig["initial"].get(pin, v[0] ^ 1 if len(v) else 0)
+            m = (t >= t0) & (t <= t1) if len(t) else np.array([], bool)
+            before = v[t < t0] if len(t) else []
+            vi = before[-1] if len(before) else init
+            n_edges += int(m.sum())
+            tt = np.concatenate([[t0], t[m], [t1]])
+            vv = np.concatenate([[vi], v[m], [v[m][-1] if m.any() else vi]])
+            off = 1.5 * (len(pins) - 1 - i)
+            ax.step(tt * k, vv + off, where="post", lw=0.8, color=PLOT_DIGITAL_COLOR)
+        if len(pins) == 1:
+            ax.set_ylim(-0.2, 1.2); ax.set_yticks([0, 1]); ax.set_ylabel(f"{pins[0]} (nível)")
+        else:
+            ax.set_ylim(-0.3, 1.5 * len(pins) - 0.3)
+            ax.set_yticks([1.5 * (len(pins) - 1 - i) + 0.5 for i in range(len(pins))]); ax.set_yticklabels(pins)
+    if d["adc"] and d["adc"]["us"]:
+        a = d["adc"]
+        t = np.array(a["us"]) / 1e3; mv = np.array(a["mv"])
+        m = (t >= t0) & (t <= t1)
+        ax2 = ax.twinx() if d["dig"] else ax
+        ax2.plot(t[m] * k, mv[m], lw=0.8, color=PLOT_ADC_COLOR, marker="." if m.sum() < 120 else None, ms=3)
+        rng = float(a["meta"].get("range_mv", 0) or 0) or (mv.max() if len(mv) else 2500)
+        ax2.set_ylim(-0.08 * rng, 1.08 * rng)
+        ax2.set_ylabel(f"{a['meta'].get('pin', 'ADC')} (mV)", color=PLOT_ADC_COLOR)
+        ax2.tick_params(axis="y", colors=PLOT_ADC_COLOR)
+        if not d["dig"]:
+            n_edges = None
+    ax.set_xlim(t0 * k, t1 * k)
+    ax.set_xlabel("tempo (µs)" if k > 1 else "tempo (ms)")
+    ax.set_title(title or d["path"].name, fontsize=11, loc="left")
+    ax.grid(alpha=0.3)
+    if n_edges is not None:
+        ax.text(0.99, 1.02, f"{n_edges} borda{'' if n_edges == 1 else 's'}", transform=ax.transAxes, fontsize=9, color="#a33", ha="right", va="bottom")
+
+
+def parse_panel(spec: str) -> tuple[Path, float | None, float | None, str]:
+    """"arquivo|t0_ms|t1_ms|título" (t0, t1 e título opcionais; vazio = janela inteira)."""
+    parts = spec.split("|") + ["", "", ""]
+    f, t0, t1, title = parts[0], parts[1].strip(), parts[2].strip(), "|".join(parts[3:]).strip("|").strip()
+    return resolve_csv(f), (float(t0) if t0 else None), (float(t1) if t1 else None), title
+
+
+def auto_panels(path: Path) -> list[tuple[Path, float | None, float | None, str]]:
+    """Janela geral + zoom no primeiro evento (rajada) do pino do trigger (ou do 1o pino com bordas)."""
+    d = load_plot_data(path)
+    panels = [(path, None, None, f"{path.stem}: janela inteira")]
+    if not d["dig"]:
+        return panels
+    res = analyze(d["dig"])
+    trig = res.get("trigger")
+    pins = [trig] if trig in res["pins"] else []
+    pins += [p for p in res["pins"] if p not in pins]
+    for pin in pins:
+        evs = res["pins"][pin]["events"]
+        if evs:
+            ev = evs[0]
+            s, b = ev["start_us"], ev["bounce_us"]
+            margin = max(20.0, 0.2 * b)
+            panels.append((path, (s - margin) / 1e3, (s + b + margin) / 1e3,
+                           f"{pin}: 1º evento, {ev['transitions']} bordas em {_br(b)} µs"))
+            break
+    return panels
+
+
+def plot_png(panels: list, out: Path, title: str = "") -> Path:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axs = plt.subplots(len(panels), 1, figsize=(9, 9), dpi=110, squeeze=False)
+    for ax, (f, t0, t1, ttl) in zip(axs[:, 0], panels):
+        plot_panel(ax, load_plot_data(f), t0, t1, ttl)
+    if title:
+        fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out)
+    plt.close(fig)
+    return out
+
+
+def show_png(paths: list[Path]):
+    """Fecha as janelas anteriores do Preview e abre os PNGs nele, no canto superior esquerdo."""
+    subprocess.run(["osascript", "-e", 'tell application "Preview" to close every window'], capture_output=True)
+    subprocess.run(["open", "-a", "Preview", *[str(p) for p in paths]], check=False)
+    time.sleep(1.0)
+    subprocess.run(["osascript", "-e", f'tell application "Preview" to set bounds of front window to {PREVIEW_BOUNDS}'],
+                   capture_output=True)
+
+
+def _fw_tuple(v: str) -> tuple:
+    return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
+
+
+def run_series(an: "Analyzer", n: int, ms: int = 1500, trigger: str = "IO10", edge: str = "fall",
+               timeout_ms: int = 300000, gap_s: float = 2.0, tag: str = "serie", groups: str | None = None,
+               settle_us: float = 5000.0, pull: str = "none", pins: str | None = None, adc_pin: str | None = None,
+               adc_rate: int = 20000, adc_atten: str = "11", show: bool = False, out=print) -> dict:
+    """N capturas com trigger em sequência (teste de bancada). Uma linha por captura e, no fim, um PNG
+    comparativo por grupo (zoom comum no 1o evento)."""
+    fw = an.status().get("fw", "")
+    if _fw_tuple(fw) < (0, 3, 1):
+        if timeout_ms > 60000:
+            out(f"firmware {fw}: timeout limitado a 60000 ms (5 min só a partir do 0.3.1)")
+        timeout_ms = min(timeout_ms, 60000)
+        if adc_pin:
+            out(f"firmware {fw}: sem captura analógica junto (precisa do 0.3.1); seguindo só com o digital")
+            adc_pin = None
+    labels = []
+    if groups:
+        for g in groups.split(","):
+            name, _, k = g.partition(":")
+            labels += [name.strip()] * int(k or 1)
+    labels = (labels + [labels[-1] if labels else ""] * n)[:n]
+    caps = []
+    for i in range(n):
+        lab = labels[i]
+        name = f"{tag}_{lab}_{i + 1}" if lab else f"{tag}_{i + 1}"
+        out(f"[{i + 1}/{n}] {('grupo ' + lab + ': ') if lab else ''}armado, esperando borda {edge} em {trigger} "
+            f"(até {timeout_ms // 1000} s)")
+        try:
+            r = an.capture(settle_us=settle_us, tag=name, ms=ms, trigger=trigger, edge=edge, timeout_ms=timeout_ms,
+                           pull=pull, pins=pins, adc_pin=adc_pin, adc_rate=adc_rate, adc_atten=adc_atten)
+        except AnalyzerError as e:
+            out(f"  {datetime.now():%H:%M:%S} erro: {e}")
+            caps.append({"i": i + 1, "group": lab, "error": str(e)})
+            time.sleep(gap_s)
+            continue
+        p = r["pins"].get(trigger) or next(iter(r["pins"].values()), {})
+        evs = p.get("events", [])
+        line = (f"  {datetime.now():%H:%M:%S} {r.get('status')}: {p.get('edges', 0)} bordas, {len(evs)} eventos")
+        if evs:
+            line += f", 1º evento {evs[0]['transitions']} bordas em {_br(evs[0]['bounce_us'])} µs"
+        if len(evs) >= 2:
+            starts = [e["start_us"] for e in evs]
+            per = (starts[-1] - starts[0]) / (len(starts) - 1)
+            line += f", rajadas a cada {_br(per / 1000, 2)} ms"
+        line += f"  ({Path(r['csv_local']).name})"
+        out(line)
+        caps.append({"i": i + 1, "group": lab, "csv": r["csv_local"], "status": r.get("status"),
+                     "edges": p.get("edges", 0), "events": len(evs),
+                     "first_event_us": evs[0]["bounce_us"] if evs else None,
+                     "first_start_us": evs[0]["start_us"] if evs else None})
+        if i < n - 1:
+            time.sleep(gap_s)
+    pngs = series_pngs(caps, tag)
+    for png in pngs:
+        out(f"gráfico: {png}")
+    if show and pngs:
+        show_png(pngs)
+    return {"fw": fw, "timeout_ms": timeout_ms, "captures": caps, "png": [str(p) for p in pngs]}
+
+
+def series_pngs(caps: list, tag: str) -> list[Path]:
+    """Um PNG por grupo (até 6 painéis por PNG), todos com o mesmo zoom: do início do 1o evento até o
+    maior evento da série, com margem."""
+    ok = [c for c in caps if c.get("csv")]
+    if not ok:
+        return []
+    spans = [c["first_event_us"] or 0 for c in ok if c.get("first_start_us") is not None]
+    span = max(spans) if spans else 0
+    margin = max(20.0, 0.2 * span)
+    order = []
+    for c in ok:
+        if c["group"] not in order:
+            order.append(c["group"])
+    pngs = []
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    for g in order:
+        mine = [c for c in ok if c["group"] == g]
+        for k in range(0, len(mine), 6):
+            part = mine[k:k + 6]
+            panels = []
+            for c in part:
+                s = c["first_start_us"] or 0.0
+                ttl = f"#{c['i']}{(' ' + g) if g else ''}: {c['events']} eventos, 1º com {_br(c['first_event_us'] or 0)} µs"
+                panels.append((Path(c["csv"]), (s - margin) / 1e3, (s + span + margin) / 1e3, ttl))
+            suffix = (f"_{g}" if g else "") + (f"_{k // 6 + 1}" if len(mine) > 6 else "")
+            pngs.append(plot_png(panels, CAPTURE_DIR / f"{stamp}_{tag}{suffix}.png",
+                                 f"Série {tag}{(': ' + g) if g else ''} (zoom no 1º evento)"))
+    return pngs
+
+
 def run_mcp():
     from mcp.server.fastmcp import FastMCP
 
@@ -527,6 +779,22 @@ def run_mcp():
                                  edge=edge, timeout_ms=timeout_ms, pre=pre), ensure_ascii=False)
 
     @mcp.tool()
+    def plot(panels: list[str] | None = None, auto_csv: str = "", title: str = "", show: bool = False) -> str:
+        """PNG quadrado (9x9 pol) de capturas salvas: degraus do digital e mV do analógico no mesmo eixo de
+        tempo, contagem de bordas por painel. panels: "arquivo|t0_ms|t1_ms|título" (arquivo em captures/
+        ou caminho; t0/t1 vazios = janela inteira). auto_csv: janela inteira + zoom no 1º evento.
+        show: abre no Preview (canto superior esquerdo). Devolve o caminho do PNG."""
+        pl = [parse_panel(x) for x in (panels or [])]
+        if auto_csv:
+            pl += auto_panels(resolve_csv(auto_csv))
+        if not pl:
+            raise AnalyzerError("passe panels ou auto_csv")
+        out = plot_png(pl, CAPTURE_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{pl[0][0].stem}_plot.png", title)
+        if show:
+            show_png([out])
+        return str(out)
+
+    @mcp.tool()
     def selftest() -> str:
         """Autoteste do analisador sem nada ligado: mede uma rajada de bounce conhecida e uma onda de 10 kHz
         geradas pelo próprio ESP e compara com o esperado."""
@@ -564,12 +832,38 @@ def main():
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pre", type=int, default=100)
     p.add_argument("--tag", default="adc")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
+    p = sub.add_parser("plot"); p.add_argument("panels", nargs="*", help='"arquivo|t0_ms|t1_ms|título"')
+    p.add_argument("--auto", help="CSV: janela inteira + zoom no 1º evento"); p.add_argument("-o", "--out")
+    p.add_argument("--title", default=""); p.add_argument("--show", action="store_true")
+    p = sub.add_parser("series"); p.add_argument("--n", type=int, required=True); p.add_argument("--ms", type=int, default=1500)
+    p.add_argument("--trigger", default="IO10"); p.add_argument("--edge", default="fall", choices=["fall", "rise", "any"])
+    p.add_argument("--timeout-ms", type=int, default=300000); p.add_argument("--gap-s", type=float, default=2.0)
+    p.add_argument("--tag", default="serie"); p.add_argument("--groups", help="nome:qtd,nome:qtd (ex. caneta:3,dedo:3)")
+    p.add_argument("--pull", default="none"); p.add_argument("--pins"); p.add_argument("--settle-us", type=float, default=5000)
+    p.add_argument("--adc-pin"); p.add_argument("--adc-rate", type=int, default=20000)
+    p.add_argument("--adc-atten", default="11", choices=["0", "2.5", "6", "11"]); p.add_argument("--show", action="store_true")
     sub.add_parser("mcp")
     a = ap.parse_args()
     if a.cmd == "mcp":
         return run_mcp()
     if a.cmd == "analyze":
         print(json.dumps(analyze_any(Path(a.csv).read_text(), a.settle_us), indent=1))
+        return
+    if a.cmd == "plot":
+        try:
+            pl = [parse_panel(x) for x in a.panels]
+            if a.auto:
+                pl += auto_panels(resolve_csv(a.auto))
+            if not pl:
+                raise AnalyzerError('passe painéis "arquivo|t0_ms|t1_ms|título" ou --auto arquivo.csv')
+            out = Path(a.out) if a.out else CAPTURE_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{pl[0][0].stem}_plot.png"
+            out = plot_png(pl, out, a.title)
+        except AnalyzerError as e:
+            print(f"erro: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(out)
+        if a.show:
+            show_png([out])
         return
     if a.cmd == "analyze-adc":
         print(json.dumps(analyze_adc(parse_adc_csv(Path(a.csv).read_text())), indent=1))
@@ -601,6 +895,12 @@ def main():
                                         timeout_ms=a.timeout_ms, pull=a.pull, pins=a.pins, tmode=a.tmode,
                                         adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten),
                              indent=1, ensure_ascii=False))
+        elif a.cmd == "series":
+            r = run_series(an, a.n, ms=a.ms, trigger=a.trigger, edge=a.edge, timeout_ms=a.timeout_ms, gap_s=a.gap_s,
+                           tag=a.tag, groups=a.groups, settle_us=a.settle_us, pull=a.pull, pins=a.pins,
+                           adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten, show=a.show,
+                           out=lambda x: print(x, flush=True))
+            sys.exit(0 if all(c.get("csv") for c in r["captures"]) else 1)
         elif a.cmd == "adc":
             print(json.dumps(an.adc(tag=a.tag, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, trig_mv=a.trig_mv,
                                     edge=a.edge, timeout_ms=a.timeout_ms, pre=a.pre), indent=1, ensure_ascii=False))
