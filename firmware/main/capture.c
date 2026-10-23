@@ -251,14 +251,25 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     if (busy_check && busy_check()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
     if (xSemaphoreTake(cap_lock, 0) != pdTRUE) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
 
-    // Buffer: o maior bloco livre de RAM interna, deixando folga para Wi-Fi e HTTP
+    // Buffer: o maior bloco livre de RAM interna, deixando folga para Wi-Fi e HTTP. Se não couber
+    // (placa WROVER: Wi-Fi e cache da PSRAM comem a RAM interna), usa a PSRAM.
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     size_t budget = largest > 40 * 1024 ? largest - 32 * 1024 : 0;
     uint32_t max_edges = budget / 5;
     if (max_edges > 30000) max_edges = 30000;
+    uint32_t caps_extra = MALLOC_CAP_INTERNAL;
+    if (max_edges < 4096 && heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) {
+        size_t pl = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+        uint32_t pe = pl > 64 * 1024 ? (pl - 32 * 1024) / 5 : 0;
+        if (pe > 200000) pe = 200000;
+        if (pe > max_edges) { max_edges = pe; caps_extra = MALLOC_CAP_SPIRAM; }
+    }
+    const char *bufkind = caps_extra == MALLOC_CAP_SPIRAM ? "psram" : "internal";
+    ESP_LOGI(TAG, "captura: buffer %s, %lu bordas (int livre %u, maior bloco %u)", bufkind,
+             (unsigned long)max_edges, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)largest);
     if (max_edges < 256) { xSemaphoreGive(cap_lock); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK; }
-    uint32_t *tbuf = heap_caps_malloc(max_edges * 4, MALLOC_CAP_32BIT | MALLOC_CAP_INTERNAL);
-    uint8_t *vbuf = heap_caps_malloc(max_edges, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    uint32_t *tbuf = heap_caps_malloc(max_edges * 4, MALLOC_CAP_32BIT | caps_extra);
+    uint8_t *vbuf = heap_caps_malloc(max_edges, MALLOC_CAP_8BIT | caps_extra);
     if (!tbuf || !vbuf) {
         free(tbuf); free(vbuf); xSemaphoreGive(cap_lock);
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK;
@@ -353,9 +364,9 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     }
     if (olen) httpd_resp_send_chunk(req, out, olen);
     len = snprintf(line, sizeof(line),
-                   "# end edges=%lu overflow=%lu max_gap_cycles=%lu status=%s loops=%lu max_edges=%lu wait_ms=%lld err=\n",
+                   "# end edges=%lu overflow=%lu max_gap_cycles=%lu status=%s loops=%lu max_edges=%lu buf=%s wait_ms=%lld err=\n",
                    (unsigned long)edges_out, (unsigned long)cap.overflow, (unsigned long)cap.max_gap, status,
-                   (unsigned long)cap.loops, (unsigned long)max_edges, waited_us / 1000);
+                   (unsigned long)cap.loops, (unsigned long)max_edges, bufkind, waited_us / 1000);
     httpd_resp_send_chunk(req, line, len);
     httpd_resp_send_chunk(req, NULL, 0);
     ESP_LOGI(TAG, "captura %s: %lu bordas, %lu voltas, gap max %lu ciclos", status, (unsigned long)edges_out,

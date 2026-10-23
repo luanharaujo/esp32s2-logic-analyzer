@@ -245,7 +245,7 @@ def analyze(parsed: dict, settle_us: float = 5000.0) -> dict:
     pins = parsed["meta"].get("pins", "").split(",") if parsed["meta"].get("pins") else []
     out = {"cpu_hz": hz, "tick_us": round(1e6 / hz, 4), "status": parsed["end"].get("status"),
            "trigger": parsed["meta"].get("trigger"), "window_ms": parsed["meta"].get("ms"),
-           "overflow": int(parsed["end"].get("overflow", 0) or 0), "pins": {}}
+           "overflow": int(parsed["end"].get("overflow", 0) or 0), "buf": parsed["end"].get("buf"), "pins": {}}
     gap = parsed["end"].get("max_gap_cycles")
     if gap and gap != "0":
         out["max_sample_gap_us"] = round(int(gap) / hz * 1e6, 3)

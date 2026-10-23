@@ -387,7 +387,7 @@ static esp_err_t status_handler(httpd_req_t *req) {
              "\"reset_detail\":\"%s\",\"prev_uptime_s\":%lu,\"boot\":%lu,"
              "\"ssid\":\"%s\",\"bssid\":\"" MACSTR "\",\"ch\":%d,\"rssi\":%d,\"ip\":\"%s\",\"gw\":\"%s\","
              "\"wifi_connects\":%lu,\"wifi_disconnects\":%lu,\"wifi_last_reason\":%u,"
-             "\"mac\":\"" MACSTR "\",\"chip_rev\":%d,\"flash_mb\":%u,\"psram_kb\":%u,\"heap_free\":%u,\"heap_min\":%u}\n",
+             "\"mac\":\"" MACSTR "\",\"chip_rev\":%d,\"flash_mb\":%u,\"psram_kb\":%u,\"heap_free\":%u,\"heap_min\":%u,\"heap_int_free\":%u,\"heap_int_largest\":%u}\n",
              HOSTNAME, app->version, app->date, app->time, app->idf_ver, run ? run->label : "?",
              ota_pending_verify ? "true" : "false", ota_last, esp_timer_get_time() / 1000000,
              reset_reason_str(), prev_diag_valid ? prev_diag.detail : "",
@@ -396,7 +396,9 @@ static esp_err_t status_handler(httpd_req_t *req) {
              have_ap ? ap.primary : 0, have_ap ? ap.rssi : 0, wifi_ip, wifi_gw,
              (unsigned long)wifi_connects, (unsigned long)wifi_disconnects, wifi_last_reason,
              MAC2STR(mac), chip.revision, (unsigned)(spi_flash_get_chip_size() >> 20), (unsigned)(psram / 1024),
-             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size());
+             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL));
     json_reply(req, buf);
     return ESP_OK;
 }
