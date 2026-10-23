@@ -169,6 +169,10 @@ esp_err_t capture_init(bool (*is_busy)(void), bool (*auth)(httpd_req_t *)) {
     return ESP_OK;
 }
 
+bool capture_lock(uint32_t wait_ms) { return xSemaphoreTake(cap_lock, pdMS_TO_TICKS(wait_ms)) == pdTRUE; }
+void capture_unlock(void) { xSemaphoreGive(cap_lock); }
+bool capture_is_busy(void) { return busy_check && busy_check(); }
+
 static int ch_index(const char *name) {
     for (int i = 0; i < N_CH; i++) {
         if (strcasecmp(name, ch_name[i]) == 0) return i;

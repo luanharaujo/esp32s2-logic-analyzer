@@ -417,7 +417,9 @@ static esp_err_t root_handler(httpd_req_t *req) {
         "GET  /levels[?pull=]  nivel atual dos canais\n"
         "GET  /capture?ms=100&trigger=IO10&edge=fall&timeout_ms=10000&pull=up&pins=IO10,IO11\n"
         "                      CSV de bordas (formato gpio_edges v1, ciclos de 240 MHz)\n"
-        "POST /gen?pin=IO10&hz=1000&duty=50   gerador de teste no canal (hz=0 desliga; X-Token)\n");
+        "POST /gen?pin=IO10&hz=1000&duty=50   gerador de teste no canal (hz=0 desliga; X-Token)\n"
+        "GET  /adc?pin=IO10&ms=100&rate=83333&atten=11[&trig_mv=1650&edge=fall&pre=100]\n"
+        "                      CSV analogico (us,raw,mv; ADC1: IO10, IO1, IO2)\n");
     return ESP_OK;
 }
 
@@ -605,6 +607,7 @@ static void start_http(void) {
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) httpd_register_uri_handler(server, &uris[i]);
     capture_register(server);
+    adc_register(server);
     http_started = true;
     ESP_LOGI(TAG, "HTTP em :80");
 }
