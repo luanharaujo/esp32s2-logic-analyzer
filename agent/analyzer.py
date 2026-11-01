@@ -22,6 +22,7 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py selftest                                          # autoteste sem nada ligado
     uv run agent/analyzer.py adc [--pin IO10] [--ms 100] [--rate 83333] [--atten 11]
                                  [--trig-mv 1650 --edge fall --timeout-ms 10000 --pre 100]  # analógico (ADC1)
+    uv run agent/analyzer.py live [--pin IO1] [--rate 5000] [--window-s 30]   # tensão ao vivo numa janela + painel 8765
     uv run agent/analyzer.py analyze-adc captures/x_adc.csv                    # offline
     uv run agent/analyzer.py plot "arq.csv|t0_ms|t1_ms|título" [...] [-o x.png] [--title T] [--show]  # PNG 9x9
     uv run agent/analyzer.py plot --auto arq.csv [--show]                     # janela inteira + zoom no 1º evento
@@ -647,6 +648,126 @@ def show_png(paths: list[Path]):
                    capture_output=True)
 
 
+PAINEL_URL = "http://127.0.0.1:8765/recursos/analisador/leitura"  # painel do Mac (Arquiteto); nunca localhost
+LIVE_PIDFILE = CAPTURE_DIR / ".live.pid"
+LIVE_GEOMETRY = "1040x640+0+30"  # canto superior esquerdo da tela principal
+
+
+def post_painel(pino: str, tipo: str, unidade: str, valores: list, resumo: str, agente: str | None = None):
+    """Manda uma leitura ao painel 8765 (cartão do recurso analisador). Nunca levanta erro nem trava (1 s)."""
+    body = {"pino": pino, "tipo": tipo, "unidade": unidade, "valores": [round(v, 1) for v in valores[-120:]],
+            "resumo": resumo[:80]}
+    if agente:
+        body["agente"] = agente
+    try:
+        req = urllib.request.Request(PAINEL_URL, data=json.dumps(body).encode(), method="POST",
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=1.0).read()
+    except Exception:
+        pass
+
+
+def _close_previous_live():
+    try:
+        old = int(LIVE_PIDFILE.read_text().strip())
+        if old != os.getpid():
+            os.kill(old, 15)
+            time.sleep(0.5)
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+
+
+def run_live(an: "Analyzer", pin: str = "IO1", ms: int = 100, rate: int = 5000, atten: str = "11",
+             window_s: float = 30.0, block_ms: float = 10.0, sat_mv: float = 2500.0, duration_s: float = 0,
+             agente: str | None = None, painel: bool = True, out=print):
+    """Tensão ao vivo numa janela (Tk, canto superior esquerdo): pede trechos de `ms` ao /adc em sequência,
+    reduz a médias de `block_ms` e mostra os últimos `window_s`. Fecha a janela 'live' anterior.
+    Manda as leituras ao painel 8765 a cada ~1 s. Ao fechar salva o histórico em captures/*_live.csv."""
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+
+    _close_previous_live()
+    CAPTURE_DIR.mkdir(exist_ok=True)
+    LIVE_PIDFILE.write_text(str(os.getpid()))
+    an.status()  # falha cedo se o ESP não está na rede
+    fig, ax = plt.subplots(figsize=(10.4, 6.4), dpi=100)
+    try:
+        fig.canvas.manager.window.wm_geometry(LIVE_GEOMETRY)
+        fig.canvas.manager.set_window_title(f"Analisador ao vivo: {pin}")
+    except Exception:
+        pass
+    line, = ax.plot([], [], lw=1.6, color="#1f77b4")
+    ax.axhspan(sat_mv, 3400, color="#d62728", alpha=0.08)
+    ax.axhline(sat_mv, color="#d62728", lw=0.8, ls="--")
+    ax.text(0.01, sat_mv + 40, f"acima de ~{sat_mv/1000:.1f} V o ADC satura (11 dB)", color="#d62728",
+            fontsize=9, transform=ax.get_yaxis_transform())
+    ax.set_ylim(-50, 3400); ax.set_xlim(-window_s, 0)
+    ax.set_xlabel("tempo (s, 0 = agora)"); ax.set_ylabel("tensão (mV)")
+    ax.grid(alpha=0.3)
+    txt = ax.text(0.99, 0.95, "", transform=ax.transAxes, ha="right", va="top", fontsize=22, family="monospace")
+    sub = ax.text(0.99, 0.86, "", transform=ax.transAxes, ha="right", va="top", fontsize=10, color="#555")
+    plt.show(block=False)
+
+    hist_t, hist_mv = [], []
+    t_start = time.monotonic(); last_post = 0.0; errors = 0; n_req = 0
+    try:
+        while plt.fignum_exists(fig.number):
+            if duration_s and time.monotonic() - t_start > duration_s:
+                break
+            try:
+                d = parse_adc_csv(an.adc_csv(pin=pin, ms=ms, rate=rate, atten=atten))
+                errors = 0; n_req += 1
+            except Exception as e:
+                errors += 1
+                sub.set_text(f"erro: {str(e)[:60]}")
+                fig.canvas.draw_idle(); plt.pause(0.5)
+                if errors >= 20:
+                    out("erro: 20 falhas seguidas, parei"); break
+                continue
+            now = time.monotonic() - t_start
+            us, mv = d["us"], d["mv"]
+            if not us:
+                plt.pause(0.05); continue
+            span = (us[-1] - us[0]) / 1e6 or ms / 1000
+            nb = max(1, int(round(span * 1000 / block_ms)))
+            per = max(1, len(mv) // nb)
+            for i in range(0, len(mv) - per + 1, per):
+                hist_mv.append(sum(mv[i:i + per]) / per)
+                hist_t.append(now - span + (us[i] - us[0]) / 1e6)
+            cut = now - max(window_s, 60)
+            while hist_t and hist_t[0] < cut:
+                hist_t.pop(0); hist_mv.pop(0)
+            line.set_data([t - now for t in hist_t], hist_mv)
+            cur = sum(mv) / len(mv)
+            vis = [v for t, v in zip(hist_t, hist_mv) if t >= now - window_s]
+            txt.set_text(f"{cur/1000:.2f} V")
+            sub.set_text(f"{pin}  faixa {min(vis):.0f} a {max(vis):.0f} mV  ({len(mv)} amostras a {rate}/s, "
+                         f"ruído ±{(max(mv)-min(mv))/2:.0f} mV)" + ("  SATURADO" if cur >= sat_mv - 30 else ""))
+            fig.canvas.draw_idle(); plt.pause(0.01)
+            if painel and now - last_post >= 1.0:
+                last_post = now
+                vals = hist_mv[-120:]
+                post_painel(pin, "adc", "mV", vals, f"{pin} {cur:.0f} mV (faixa {min(vals):.0f}-{max(vals):.0f})",
+                            agente)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            if LIVE_PIDFILE.read_text().strip() == str(os.getpid()):
+                LIVE_PIDFILE.unlink()
+        except FileNotFoundError:
+            pass
+        plt.close("all")
+    path = None
+    if hist_t:
+        path = CAPTURE_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{pin}_live.csv"
+        path.write_text("# live_adc v1 t_s,mv (médias de %g ms)\n" % block_ms +
+                        "".join(f"{t:.3f},{v:.1f}\n" for t, v in zip(hist_t, hist_mv)))
+    out(json.dumps({"requests": n_req, "secs": round(time.monotonic() - t_start, 1),
+                    "csv_local": str(path) if path else None}, ensure_ascii=False))
+
+
 def _fw_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
 
@@ -1152,6 +1273,10 @@ def main():
     p.add_argument("--trig-mv", type=int); p.add_argument("--edge", default="fall", choices=["fall", "rise"])
     p.add_argument("--timeout-ms", type=int, default=10000); p.add_argument("--pre", type=int, default=100)
     p.add_argument("--tag", default="adc")
+    p = sub.add_parser("live"); p.add_argument("--pin", default="IO1"); p.add_argument("--ms", type=int, default=100)
+    p.add_argument("--rate", type=int, default=5000); p.add_argument("--atten", default="11", choices=["0", "2.5", "6", "11"])
+    p.add_argument("--window-s", type=float, default=30); p.add_argument("--duration-s", type=float, default=0)
+    p.add_argument("--agente"); p.add_argument("--no-painel", action="store_true")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
     p = sub.add_parser("presses"); p.add_argument("csv"); p.add_argument("--pin", default="IO10")
     p.add_argument("--silence-ms", type=float, default=20.0); p.add_argument("--ref", help="voltas de referência em ms, separadas por vírgula")
@@ -1265,6 +1390,9 @@ def main():
                            adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten, show=a.show,
                            out=lambda x: print(x, flush=True))
             sys.exit(0 if all(c.get("csv") for c in r["captures"]) else 1)
+        elif a.cmd == "live":
+            run_live(an, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, window_s=a.window_s,
+                     duration_s=a.duration_s, agente=a.agente, painel=not a.no_painel)
         elif a.cmd == "adc":
             print(json.dumps(an.adc(tag=a.tag, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, trig_mv=a.trig_mv,
                                     edge=a.edge, timeout_ms=a.timeout_ms, pre=a.pre), indent=1, ensure_ascii=False))
