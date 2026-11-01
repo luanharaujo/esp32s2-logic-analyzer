@@ -23,6 +23,8 @@ O ESP se anuncia por mDNS como logic-s2.local (nunca IP fixo). Uso:
     uv run agent/analyzer.py adc [--pin IO10] [--ms 100] [--rate 83333] [--atten 11]
                                  [--trig-mv 1650 --edge fall --timeout-ms 10000 --pre 100]  # analógico (ADC1)
     uv run agent/analyzer.py live [--pin IO1] [--rate 5000] [--window-s 30]   # tensão ao vivo numa janela + painel 8765
+    uv run agent/analyzer.py adc-log --adc-pin IO1 --out x.csv [--chunk-ms 500] [--duration-s N]  # até SIGINT/SIGTERM, epoch_ms,mv
+    uv run agent/analyzer.py adc-plot x.csv [-o x.png] [--show]                # PNG tensão x tempo do adc-log
     uv run agent/analyzer.py analyze-adc captures/x_adc.csv                    # offline
     uv run agent/analyzer.py plot "arq.csv|t0_ms|t1_ms|título" [...] [-o x.png] [--title T] [--show]  # PNG 9x9
     uv run agent/analyzer.py plot --auto arq.csv [--show]                     # janela inteira + zoom no 1º evento
@@ -768,6 +770,82 @@ def run_live(an: "Analyzer", pin: str = "IO1", ms: int = 100, rate: int = 5000, 
                     "csv_local": str(path) if path else None}, ensure_ascii=False))
 
 
+
+def run_adc_log(an: "Analyzer", out_path: str, pin: str = "IO1", chunk_ms: int = 500, rate: int = 1000,
+                atten: str = "11", duration_s: float = 0, out=print):
+    """Grava o ADC em trechos seguidos até SIGINT/SIGTERM (ou duration_s), num CSV `epoch_ms,mv` gravado
+    trecho a trecho (flush). Hora de cada amostra = relógio do Mac, estimada pelo meio da latência extra da
+    requisição (incerteza ~metade dela). Metadados em <out>.meta.json. Entre trechos há buraco (~370 ms)."""
+    import signal
+
+    class _Stop(Exception):
+        pass
+
+    def _h(signum, frame):
+        raise _Stop()
+    signal.signal(signal.SIGINT, _h); signal.signal(signal.SIGTERM, _h)
+    out_p = Path(out_path); out_p.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"format": "adc_epoch v1", "pin": pin, "rate": rate, "chunk_ms": chunk_ms, "atten_db": atten,
+            "t_start_epoch_ms": int(time.time() * 1000)}
+    lat, n, first = [], 0, None
+    f = out_p.open("w")
+    f.write("epoch_ms,mv\n"); f.flush()
+    try:
+        _ = an.ip
+        t_end = time.time() + duration_s if duration_s else None
+        while t_end is None or time.time() < t_end:
+            ts = time.time() * 1000
+            d = parse_adc_csv(an.adc_csv(pin=pin, ms=chunk_ms, rate=rate, atten=atten))
+            tr = time.time() * 1000
+            extra = max(0.0, tr - ts - chunk_ms); lat.append(extra)
+            start = ts + extra / 2
+            if first is None and d["us"]:
+                first = start; meta["first_sample_epoch_ms"] = round(start, 1)
+                meta["startup_ms"] = round(start - meta["t_start_epoch_ms"], 1)
+            u0 = d["us"][0] if d["us"] else 0
+            f.writelines(f"{start + (u - u0) / 1000:.1f},{v}\n" for u, v in zip(d["us"], d["mv"]))
+            f.flush(); n += len(d["mv"])
+    except _Stop:
+        pass
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        f.close()
+        meta.update(t_stop_epoch_ms=int(time.time() * 1000), samples=n, chunks=len(lat),
+                    extra_latency_ms_median=round(sorted(lat)[len(lat) // 2], 1) if lat else None)
+        Path(str(out_p) + ".meta.json").write_text(json.dumps(meta, indent=1))
+        out(json.dumps({"csv": str(out_p), **meta}, ensure_ascii=False))
+
+
+def plot_adc_epoch_png(csv_path: Path, out: Path, title: str = "") -> Path:
+    """PNG tensão x tempo de um CSV `epoch_ms,mv` (adc-log): amostras brutas + média de 20 ms."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    T, V = [], []
+    for line in csv_path.read_text().splitlines()[1:]:
+        if line and line[0] != "#":
+            a, b = line.split(","); T.append(float(a)); V.append(int(b))
+    if not T:
+        raise AnalyzerError(f"{csv_path} sem amostras")
+    t0 = T[0]; T = [(t - t0) / 1000 for t in T]
+    bt, bv, cur = [], [], []
+    for t, v in zip(T, V):
+        if cur and t - cur[0][0] > 0.02:
+            bt.append(sum(x for x, _ in cur) / len(cur)); bv.append(sum(y for _, y in cur) / len(cur)); cur = []
+        cur.append((t, v))
+    fig, ax = plt.subplots(figsize=(10.4, 6.4), dpi=100)
+    ax.plot(T, V, ",", color="#9ecae1", alpha=0.6, label="amostras brutas")
+    ax.plot(bt, bv, ".", ms=2.5, color="#1f77b4", label="média de 20 ms")
+    ax.axhline(2500, color="#d62728", lw=0.8, ls="--")
+    ax.text(0.01, 2530, "saturação ~2,5 V (11 dB)", color="#d62728", fontsize=9, transform=ax.get_yaxis_transform())
+    ax.set_ylim(-50, 3400)
+    ax.set_xlabel(f"tempo (s) desde {datetime.fromtimestamp(t0 / 1000):%H:%M:%S}.{int(t0 % 1000):03d} (epoch {t0:.0f} ms)")
+    ax.set_ylabel("tensão (mV)"); ax.grid(alpha=0.3); ax.legend(loc="upper left", fontsize=9)
+    ax.set_title(title or f"{csv_path.name}: {len(V)} amostras, mín {min(V)} / máx {max(V)} mV")
+    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+    return out
+
+
 def _fw_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
 
@@ -1277,6 +1355,11 @@ def main():
     p.add_argument("--rate", type=int, default=5000); p.add_argument("--atten", default="11", choices=["0", "2.5", "6", "11"])
     p.add_argument("--window-s", type=float, default=30); p.add_argument("--duration-s", type=float, default=0)
     p.add_argument("--agente"); p.add_argument("--no-painel", action="store_true")
+    p = sub.add_parser("adc-log"); p.add_argument("--adc-pin", default="IO1"); p.add_argument("--out", required=True)
+    p.add_argument("--chunk-ms", type=int, default=500); p.add_argument("--rate", type=int, default=1000)
+    p.add_argument("--atten", default="11", choices=["0", "2.5", "6", "11"]); p.add_argument("--duration-s", type=float, default=0)
+    p = sub.add_parser("adc-plot"); p.add_argument("csv"); p.add_argument("-o", "--out"); p.add_argument("--title", default="")
+    p.add_argument("--show", action="store_true")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
     p = sub.add_parser("presses"); p.add_argument("csv"); p.add_argument("--pin", default="IO10")
     p.add_argument("--silence-ms", type=float, default=20.0); p.add_argument("--ref", help="voltas de referência em ms, separadas por vírgula")
@@ -1390,6 +1473,13 @@ def main():
                            adc_pin=a.adc_pin, adc_rate=a.adc_rate, adc_atten=a.adc_atten, show=a.show,
                            out=lambda x: print(x, flush=True))
             sys.exit(0 if all(c.get("csv") for c in r["captures"]) else 1)
+        elif a.cmd == "adc-log":
+            run_adc_log(an, a.out, pin=a.adc_pin, chunk_ms=a.chunk_ms, rate=a.rate, atten=a.atten, duration_s=a.duration_s)
+        elif a.cmd == "adc-plot":
+            src = Path(a.csv); png = plot_adc_epoch_png(src, Path(a.out) if a.out else src.with_suffix(".png"), a.title)
+            print(png)
+            if a.show:
+                show_png([png])
         elif a.cmd == "live":
             run_live(an, pin=a.pin, ms=a.ms, rate=a.rate, atten=a.atten, window_s=a.window_s,
                      duration_s=a.duration_s, agente=a.agente, painel=not a.no_painel)
