@@ -2,8 +2,8 @@
 # requires-python = ">=3.11"
 # dependencies = ["mcp>=1.2,<2", "matplotlib>=3.8"]
 # ///
-"""Testes sem hardware: um ESP falso (HTTP local) responde como o firmware; confere CLI, análise e OTA.
-Uso: uv run tests/test_offline.py"""
+"""Tests without hardware: a fake ESP (local HTTP) answers like the firmware; checks CLI, analysis and OTA.
+Usage: uv run tests/test_offline.py"""
 import hashlib, json, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,8 +22,8 @@ PATTERN = [3, 5, 12, 8, 40, 25, 20000, 4, 6, 15, 10, 60]
 
 
 def fake_combined(q: dict, ms: int) -> str:
-    """Captura combinada: IO10 digital (cai em 0, sobe em 300 µs, cai de vez em 600 µs) e o mesmo nó no
-    ADC (IO1, 20 kHz) desde 1 ms antes do trigger, com as amostras atrasadas até 1 período."""
+    """Combined capture: IO10 digital (falls at 0, rises at 300 us, falls for good at 600 us) and the same
+    node on the ADC (IO1, 20 kHz) from 1 ms before the trigger, with samples up to 1 period late."""
     lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall tmode=poll pins=IO10",
              "# initial IO10=1", "cycles,pin,level", "0,IO10,0", f"{300 * 240},IO10,1", f"{600 * 240},IO10,0",
              "# end edges=3 overflow=0 max_gap_cycles=22 status=ok loops=1 max_edges=1 buf=psram wait_ms=10 err="]
@@ -47,7 +47,7 @@ def fake_csv(q: dict) -> str:
     ms = int(q.get("ms", ["100"])[0])
     if q.get("adc_pin"):
         return fake_combined(q, ms)
-    if state.get("bounce") and q.get("pins", [""])[0] == "IO10":  # rajada do gerador, borda a borda
+    if state.get("bounce") and q.get("pins", [""])[0] == "IO10":  # generator burst, edge by edge
         state["bounce"] = False
         lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall pins=IO10",
                  "# initial IO10=1", "cycles,pin,level"]
@@ -69,12 +69,12 @@ def fake_csv(q: dict) -> str:
     trig = q.get("trigger", ["none"])[0]
     lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=up trigger={trig} edge=fall pins=IO10,IO11",
              "# initial IO10=1 IO11=0", "cycles,pin,level"]
-    t, lv = 0, 0  # bounce no IO10: 6 transições em ~300 µs, depois estável
+    t, lv = 0, 0  # bounce on IO10: 6 transitions in ~300 us, then stable
     for w_us in [0, 2.5, 10, 40, 120, 130]:
         t += int(w_us * HZ / 1e6)
         lines.append(f"{t},IO10,{lv}")
         lv ^= 1
-    if state["gen"]:  # onda de 1 kHz, 50% no IO11
+    if state["gen"]:  # 1 kHz wave, 50% on IO11
         for k in range(2 * ms):
             lines.append(f"{k * HZ // 2000 + 7},IO11,{(k + 1) % 2}")
     n = len(lines) - 3
@@ -83,8 +83,8 @@ def fake_csv(q: dict) -> str:
 
 
 def fake_adc(q: dict):
-    """Botão no IO10 (pull-up 10 kΩ a 3,3 V, satura em 4095) com ruído de 60 Hz de 30 mV e um aperto com
-    bounce lento: cai em 2 ms, volta em 2,3 ms, cai de vez em 2,6 ms."""
+    """Button on IO10 (10 kOhm pull-up to 3.3 V, saturates at 4095) with 30 mV of 60 Hz hum and a press
+    with slow bounce: falls at 2 ms, returns at 2.3 ms, falls for good at 2.6 ms."""
     import math
     pin = q.get("pin", ["IO10"])[0]
     if pin in ("IO11", "IO12", "IO13", "IO17", "IO18"):
@@ -104,8 +104,8 @@ def fake_adc(q: dict):
 
 
 def fake_record_csv() -> str:
-    """Gravação contínua: 3 apertos (bounce de 3 bordas + soltura) em 0,5 s, 1,2 s e 2,0 s; depois do
-    buffer cheio, 1 rajada só em resumo; janela analógica do 1o evento."""
+    """Continuous recording: 3 presses (3-edge bounce + release) at 0.5 s, 1.2 s and 2.0 s; after the
+    buffer fills, 1 burst as a summary only; analog window for the first event."""
     C = 240
     lines = ["# gpio_edges v1 mode=s2record cpu_hz=240000000 ms=3000 pull=none trigger=none edge=any tmode=record pins=IO10",
              "# initial IO10=1", "cycles,pin,level"]
@@ -139,7 +139,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         u = urlparse(self.path); q = parse_qs(u.query)
         if u.path == "/status":
-            if state.get("reboot_on_status"):  # simula panic + rollback durante a série
+            if state.get("reboot_on_status"):  # simulate a panic + rollback during the series
                 state["reboot_on_status"] -= 1
                 if state["reboot_on_status"] == 0:
                     state.update(boot=state["boot"] + 1, fw="0.2.3")
@@ -153,7 +153,7 @@ class H(BaseHTTPRequestHandler):
         elif u.path == "/adc":
             body = fake_adc(q)
             if body is None:
-                self.reply(400, "pino do ADC2 (conflita com o Wi-Fi); use IO10, IO1 ou IO2 (ADC1)", "text/plain")
+                self.reply(400, "ADC2 pin (conflicts with Wi-Fi); use IO10, IO1 or IO2 (ADC1)", "text/plain")
             else:
                 self.reply(200, body, "text/csv")
         elif u.path == "/record/status":
@@ -169,7 +169,7 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path); q = parse_qs(u.query)
-        if self.headers.get("X-Token") != TOKEN and not u.path.startswith("/record"):  # /record não exige token
+        if self.headers.get("X-Token") != TOKEN and not u.path.startswith("/record"):  # /record needs no token
             return self.reply(403, '{"ok":false,"err":"token"}')
         n = int(self.headers.get("Content-Length", 0)); d = self.rfile.read(n)
         if u.path == "/record":
@@ -205,121 +205,121 @@ def check(name, cond, extra=""):
 st = an.status(); check("status", st["fw"] == "0.2.0")
 check("levels", an.levels("up")["ch"]["IO10"] == 1)
 check("gen", an.gen("IO11", 1000)["ok"])
-res = an.capture(ms=100, trigger="IO10", edge="fall", pull="up", tag="teste")
+res = an.capture(ms=100, trigger="IO10", edge="fall", pull="up", tag="test")
 io10 = res["pins"]["IO10"]
-check("bounce: 1 evento", len(io10["events"]) == 1, io10)
+check("bounce: 1 event", len(io10["events"]) == 1, io10)
 ev = io10["events"][0]
-check("bounce: 6 transições", ev["transitions"] == 6, ev)
-check("bounce: duração 302,5 µs", abs(ev["bounce_us"] - 302.5) < 0.01, ev)
-check("bounce: menor pulso 2,5 µs", abs(ev["min_pulse_us"] - 2.5) < 0.01, ev)
+check("bounce: 6 transitions", ev["transitions"] == 6, ev)
+check("bounce: duration 302.5 us", abs(ev["bounce_us"] - 302.5) < 0.01, ev)
+check("bounce: shortest pulse 2.5 us", abs(ev["min_pulse_us"] - 2.5) < 0.01, ev)
 io11 = res["pins"]["IO11"]
-check("gerador: 1 kHz", abs(io11.get("freq_hz", 0) - 1000) < 1, io11)
-check("gerador: duty 50%", abs(io11.get("duty_pct", 0) - 50) < 1, io11)
-check("período médio de amostra", res.get("mean_sample_period_us") == 0.1, res.get("mean_sample_period_us"))
+check("generator: 1 kHz", abs(io11.get("freq_hz", 0) - 1000) < 1, io11)
+check("generator: duty 50%", abs(io11.get("duty_pct", 0) - 50) < 1, io11)
+check("mean sample period", res.get("mean_sample_period_us") == 0.1, res.get("mean_sample_period_us"))
 csv_path = Path(res["csv_local"])
-check("CSV salvo", csv_path.exists())
+check("CSV saved", csv_path.exists())
 off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(csv_path)],
                                 capture_output=True, text=True).stdout)
-check("analyze offline igual", off["pins"]["IO10"]["events"][0]["transitions"] == 6)
+check("offline analyze matches", off["pins"]["IO10"]["events"][0]["transitions"] == 6)
 csv_path.unlink()
-ad = an.adc(pin="IO10", ms=50, rate=20000, tag="teste_adc")
-check("adc: 1000 amostras", ad["samples"] == 1000, ad)
-check("adc: taxa medida", ad["sps_measured"] == 19997, ad)
-check("adc: satura no alto", ad["saturated_pct"] > 0 and ad["max_mv"] == 2500, ad)
-check("adc: 3 cruzamentos (bounce lento)", ad["crossings"] == 3, ad)
-check("adc: bounce dura 600 µs", abs(ad.get("cross_span_us", 0) - 600) < 60, ad)
-check("adc: ruído de 60 Hz", 15 < ad.get("tone_60hz_mv", 0) < 45, ad)
+ad = an.adc(pin="IO10", ms=50, rate=20000, tag="test_adc")
+check("adc: 1000 samples", ad["samples"] == 1000, ad)
+check("adc: measured rate", ad["sps_measured"] == 19997, ad)
+check("adc: saturates high", ad["saturated_pct"] > 0 and ad["max_mv"] == 2500, ad)
+check("adc: 3 crossings (slow bounce)", ad["crossings"] == 3, ad)
+check("adc: bounce lasts 600 us", abs(ad.get("cross_span_us", 0) - 600) < 60, ad)
+check("adc: 60 Hz hum", 15 < ad.get("tone_60hz_mv", 0) < 45, ad)
 adc_path = Path(ad["csv_local"])
 off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze-adc", str(adc_path)],
                                 capture_output=True, text=True).stdout)
-check("analyze-adc offline igual", off["crossings"] == 3, off)
+check("offline analyze-adc matches", off["crossings"] == 3, off)
 adc_path.unlink()
 try:
-    an.adc(pin="IO11"); check("adc: ADC2 recusado", False)
+    an.adc(pin="IO11"); check("adc: ADC2 rejected", False)
 except analyzer.AnalyzerError as e:
-    check("adc: ADC2 recusado", "ADC2" in str(e), e)
-cb = an.capture(ms=20, trigger="IO10", edge="fall", adc_pin="IO1", adc_rate=20000, tag="teste_comb")
-check("combinada: digital intacto", cb["pins"]["IO10"]["events"][0]["transitions"] == 3, cb["pins"]["IO10"])
+    check("adc: ADC2 rejected", "ADC2" in str(e), e)
+cb = an.capture(ms=20, trigger="IO10", edge="fall", adc_pin="IO1", adc_rate=20000, tag="test_comb")
+check("combined: digital intact", cb["pins"]["IO10"]["events"][0]["transitions"] == 3, cb["pins"]["IO10"])
 cmp_ = cb.get("compare", {})
-check("combinada: 3 cruzamentos no ADC", cmp_.get("adc_crossings") == 3, cmp_)
-check("combinada: atraso < 1 amostra", 0 <= cmp_.get("first_lag_us", -1) <= 50, cmp_)
-check("combinada: pré-trigger negativo", cmp_.get("adc_from_us", 0) < -900, cmp_)
-check("combinada: duração igual", abs(cmp_.get("adc_span_us", 0) - cmp_.get("digital_span_us", 0)) <= 50, cmp_)
-check("combinada: taxa real", cb["adc"]["rate_sps"] == 20000.0, cb["adc"])
-check("combinada: atenuação e status", cb["adc"]["atten_db"] == "11" and cb["adc"]["status"] == "ok", cb["adc"])
+check("combined: 3 crossings on the ADC", cmp_.get("adc_crossings") == 3, cmp_)
+check("combined: lag < 1 sample", 0 <= cmp_.get("first_lag_us", -1) <= 50, cmp_)
+check("combined: negative pre-trigger", cmp_.get("adc_from_us", 0) < -900, cmp_)
+check("combined: same duration", abs(cmp_.get("adc_span_us", 0) - cmp_.get("digital_span_us", 0)) <= 50, cmp_)
+check("combined: real rate", cb["adc"]["rate_sps"] == 20000.0, cb["adc"])
+check("combined: attenuation and status", cb["adc"]["atten_db"] == "11" and cb["adc"]["status"] == "ok", cb["adc"])
 old = analyzer.parse_combined_adc("# adc_samples v1 pin=IO1 t0=digital\ncycles,raw,mv\n100,4095,2500\n"
                                   "# adc_end samples=1 wanted=1 chain=1280 invalid=0 period_cycles=24000 first_cycles=100 slice_ms=64\n")
-check("combinada: cabeçalho do 0.3.1 (taxa pelo período)", abs(float(old["meta"]["rate"]) - 10000) < 1e-6, old["meta"])
+check("combined: 0.3.1 header (rate from period)", abs(float(old["meta"]["rate"]) - 10000) < 1e-6, old["meta"])
 comb_path = Path(cb["csv_local"])
 off = json.loads(subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "analyze", str(comb_path)],
                                 capture_output=True, text=True).stdout)
-check("analyze offline combinada", off["compare"]["adc_crossings"] == 3, off.get("compare"))
-# plot: painéis manuais (combinada, com zoom em µs) e automático; PNG quadrado 990x990
+check("offline analyze, combined", off["compare"]["adc_crossings"] == 3, off.get("compare"))
+# plot: manual panels (combined, zoom in us) and automatic; square 990x990 PNG
 import matplotlib.pyplot as plt  # noqa: E402
-png = analyzer.plot_png([analyzer.parse_panel(f"{comb_path}|-1|20|combinada"),
-                         analyzer.parse_panel(f"{comb_path}|-0.05|0.7|zoom")], ROOT / "captures/_teste_plot.png", "teste")
+png = analyzer.plot_png([analyzer.parse_panel(f"{comb_path}|-1|20|combined"),
+                         analyzer.parse_panel(f"{comb_path}|-0.05|0.7|zoom")], ROOT / "captures/_test_plot.png", "test")
 check("plot: PNG 990x990", plt.imread(png).shape[:2] == (990, 990), plt.imread(png).shape)
 png.unlink()
 auto = analyzer.auto_panels(comb_path)
-check("plot --auto: 2 painéis, zoom no 1º evento", len(auto) == 2 and auto[1][1] < 0 < auto[1][2] < 1, auto)
+check("plot --auto: 2 panels, zoom on the first event", len(auto) == 2 and auto[1][1] < 0 < auto[1][2] < 1, auto)
 cli = subprocess.run(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "plot", "--auto", str(comb_path), "-o",
-                      str(ROOT / "captures/_teste_cli.png")], capture_output=True, text=True)
-check("plot CLI", cli.returncode == 0 and (ROOT / "captures/_teste_cli.png").exists(), cli.stderr[-300:])
-(ROOT / "captures/_teste_cli.png").unlink(missing_ok=True)
+                      str(ROOT / "captures/_test_cli.png")], capture_output=True, text=True)
+check("plot CLI", cli.returncode == 0 and (ROOT / "captures/_test_cli.png").exists(), cli.stderr[-300:])
+(ROOT / "captures/_test_cli.png").unlink(missing_ok=True)
 comb_path.unlink()
-# series: começa no 0.3.4 com ADC; o ESP "reinicia" no 0.2.3 antes da 2a captura -> avisa e adapta
+# series: starts on 0.3.4 with the ADC; the ESP "restarts" on 0.2.3 before the second capture -> warns and adapts
 state.update(fw="0.3.4", reboot_on_status=2)
 lines = []
-sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="teste_serie_rb",
+sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="test_series_rb",
                          adc_pin="IO1", out=lines.append)
-check("series: detecta reinício", any("reiniciou" in x for x in lines), lines)
-check("series: adapta ao fw do rollback", sr["timeout_ms"] == 60000 and sr["adc_pin"] is None
+check("series: detects restart", any("restarted" in x for x in lines), lines)
+check("series: adapts to the rollback fw", sr["timeout_ms"] == 60000 and sr["adc_pin"] is None
       and state["last_capture_q"]["timeout_ms"] == ["60000"], (sr["timeout_ms"], state["last_capture_q"]))
 for c in sr["captures"]:
     Path(c["csv"]).unlink()
 for x in sr["png"]:
     Path(x).unlink()
-# record (fw >= 0.4.0): 3 eventos completos + 1 só em resumo, PNG, recusa em fw antigo
+# record (fw >= 0.4.0): 3 full events + 1 summary only, PNG, rejected on old fw
 state.update(fw="0.4.3", reboot_on_status=0)
 lines = []
-rr = analyzer.run_record(an, s=1, pins="IO10", adc_pin="IO1", tag="teste_rec", live=True, out=lines.append)
-check("record: parâmetros", state["record_q"]["s"] == ["1"] and state["record_q"]["adc_pin"] == ["IO1"], state.get("record_q"))
-check("record: 7 eventos, 4 apertos (1 em resumo)", len(rr["events"]) == 7 and rr["presses"] == 4
-      and rr["events"][6].get("only_summary") and rr["events"][1]["kind"] == "soltura", rr["events"])
-check("record: 1º evento 3 bordas em 9 µs", rr["events"][0]["transitions"] == 3 and abs(rr["events"][0]["bounce_us"] - 9) < 0.01,
+rr = analyzer.run_record(an, s=1, pins="IO10", adc_pin="IO1", tag="test_rec", live=True, out=lines.append)
+check("record: parameters", state["record_q"]["s"] == ["1"] and state["record_q"]["adc_pin"] == ["IO1"], state.get("record_q"))
+check("record: 7 events, 4 presses (1 summary only)", len(rr["events"]) == 7 and rr["presses"] == 4
+      and rr["events"][6].get("only_summary") and rr["events"][1]["kind"] == "release", rr["events"])
+check("record: first event 3 edges in 9 us", rr["events"][0]["transitions"] == 3 and abs(rr["events"][0]["bounce_us"] - 9) < 0.01,
       rr["events"][0])
-check("record: hora de parede", all(len(e["wall"]) == 12 for e in rr["events"]), [e["wall"] for e in rr["events"]])
-check("record: eventos ao vivo", sum("evento" in x and "às" in x for x in lines) == 2, lines)
+check("record: wall-clock time", all(len(e["wall"]) == 12 for e in rr["events"]), [e["wall"] for e in rr["events"]])
+check("record: live events", sum("event" in x and " at " in x for x in lines) == 2, lines)
 check("record: PNG", rr["png"] and Path(rr["png"]).exists() and plt.imread(rr["png"]).shape[:2] == (990, 990), rr["png"])
 ra = analyzer.analyze_any(Path(rr["csv_local"]).read_text())
-check("record: ADC por evento sem tom", "tone_60hz_mv" not in ra["adc"] and ra["adc"]["samples"] == 1000, ra["adc"])
-check("record: 4 apertos reais", len(rr["real_presses"]) == 4, rr["real_presses"])
+check("record: per-event ADC without hum", "tone_60hz_mv" not in ra["adc"] and ra["adc"]["samples"] == 1000, ra["adc"])
+check("record: 4 real presses", len(rr["real_presses"]) == 4, rr["real_presses"])
 gr = analyzer.find_presses(Path(rr["csv_local"]).read_text())
-pr = [g for g in gr if g["kind"] == "aperto"]
-check("presses: última descida (regra do STM32)", abs(pr[0]["last_fall_us"] - 500009) < 0.01, pr[0])
+pr = [g for g in gr if g["kind"] == "press"]
+check("presses: last falling edge (STM32 rule)", abs(pr[0]["last_fall_us"] - 500009) < 0.01, pr[0])
 ml = analyzer.match_laps(gr, [700.0 * 1.0015, 600.0 * 1.0015, 5000.0])
-check("presses: voltas e razão de relógio", ml[0]["lap_ms"] == 700.0 and abs(ml[1]["lap_ms"] - 600.05) < 0.01
+check("presses: laps and clock ratio", ml[0]["lap_ms"] == 700.0 and abs(ml[1]["lap_ms"] - 600.05) < 0.01
       and abs(ml[0]["clock_ppm"] - 1500) < 100 and ml[2]["lap_ms"] is None, ml)
-png2 = analyzer.plot_presses_png(Path(rr["csv_local"]), gr, ROOT / "captures/_teste_apertos.png")
+png2 = analyzer.plot_presses_png(Path(rr["csv_local"]), gr, ROOT / "captures/_test_presses.png")
 check("presses: PNG", plt.imread(png2).shape[:2] == (990, 990))
 png2.unlink()
 Path(rr["csv_local"]).unlink(); Path(rr["png"]).unlink()
 state["fw"] = "0.3.4"
 try:
-    analyzer.run_record(an, s=1, out=lines.append); check("record: recusa fw < 0.4.0", False)
+    analyzer.run_record(an, s=1, out=lines.append); check("record: rejects fw < 0.4.0", False)
 except analyzer.AnalyzerError as e:
-    check("record: recusa fw < 0.4.0", "0.4.0" in str(e), e)
+    check("record: rejects fw < 0.4.0", "0.4.0" in str(e), e)
 state["fw"] = "0.2.0"
-# series: firmware 0.2.0 -> timeout limitado a 60 s e sem ADC; 2 grupos de 1
+# series: firmware 0.2.0 -> timeout capped at 60 s and no ADC; 2 groups of 1
 lines = []
 state["bounce"] = False
-sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="teste_serie",
-                         groups="caneta:1,dedo:1", adc_pin="IO1", out=lines.append)
-check("series: timeout limitado no fw antigo", sr["timeout_ms"] == 60000 and state["last_capture_q"]["timeout_ms"] == ["60000"], sr)
-check("series: sem ADC no fw antigo", "adc_pin" not in state["last_capture_q"], state["last_capture_q"])
-check("series: 2 capturas com evento", [c["events"] for c in sr["captures"]] == [1, 1], sr["captures"])
-check("series: 1 PNG por grupo", len(sr["png"]) == 2 and all(Path(x).exists() for x in sr["png"]), sr["png"])
-check("series: linha por captura", sum("bordas" in x for x in lines) == 2, lines)
+sr = analyzer.run_series(an, 2, ms=100, trigger="IO10", timeout_ms=300000, gap_s=0, tag="test_series",
+                         groups="pen:1,finger:1", adc_pin="IO1", out=lines.append)
+check("series: timeout capped on old fw", sr["timeout_ms"] == 60000 and state["last_capture_q"]["timeout_ms"] == ["60000"], sr)
+check("series: no ADC on old fw", "adc_pin" not in state["last_capture_q"], state["last_capture_q"])
+check("series: 2 captures with an event", [c["events"] for c in sr["captures"]] == [1, 1], sr["captures"])
+check("series: 1 PNG per group", len(sr["png"]) == 2 and all(Path(x).exists() for x in sr["png"]), sr["png"])
+check("series: one line per capture", sum("edges" in x for x in lines) == 2, lines)
 for c in sr["captures"]:
     Path(c["csv"]).unlink()
 for x in sr["png"]:
@@ -331,7 +331,7 @@ binp = ROOT / "firmware/build/s2la.bin"
 if binp.exists():
     r = an.ota(str(binp), expect="0.2.1")
     check("ota", r["ok"] and r["after_fw"] == "0.2.1", r)
-# MCP: lista de ferramentas
+# MCP: tool list
 p = subprocess.Popen(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "mcp"], stdin=subprocess.PIPE,
                      stdout=subprocess.PIPE, text=True)
 msgs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -344,5 +344,5 @@ p.stdout.readline()
 tools = [t["name"] for t in json.loads(p.stdout.readline())["result"]["tools"]]
 p.kill()
 check("MCP tools", set(tools) >= {"status", "capture", "levels", "channels", "test_generator", "device_log", "adc"}, tools)
-print("FALHAS:", fails)
+print("FAILURES:", fails)
 sys.exit(1 if fails else 0)
