@@ -1,14 +1,14 @@
-// Captura analógica (lenta) num canal do ADC1, pelo modo contínuo (DMA) do ESP32-S2.
+// Slow analog capture on one ADC1 channel, using the ESP32-S2 continuous (DMA) mode.
 //
-// Pinos: só os do ADC1 que estão no header sem solda: IO1 (ADC1_CH0, pino 10), IO2 (ADC1_CH1, pino 12) e
-// IO10 (ADC1_CH9, pino 5). Os outros canais sem solda (IO11/12/13/17/18) são do ADC2, que o Wi-Fi usa:
-// no S2 o árbitro dá prioridade ao Wi-Fi e as leituras falham ou vêm inválidas com o Wi-Fi ligado.
-// Velocidade: o modo contínuo da IDF 4.4 aceita 611 a 83333 amostras/s no S2 (SOC_ADC_SAMPLE_FREQ_THRES_*),
-// 12 bits por amostra (formato TYPE1, unidade única). O DMA (do SPI3) enche um anel de bytes; a tarefa
-// do HTTP copia para a PSRAM, sem mascarar interrupções: Wi-Fi e watchdog seguem normais.
-// Pino: o driver desliga a entrada digital e os pulls do pad (gpio_config MODE_DISABLE). Nada de pull é
-// ligado. No fim, o registrador IO_MUX do pino volta exatamente ao que era (entrada, pulls, função), e o
-// bundle de GPIO dedicado da captura digital continua ligado (a matriz de entrada não é tocada).
+// Pins: only the ADC1 pins on the header that need no soldering: IO1 (ADC1_CH0, pin 10), IO2 (ADC1_CH1,
+// pin 12) and IO10 (ADC1_CH9, pin 5). The other solder-free channels (IO11/12/13/17/18) are on ADC2,
+// which Wi-Fi uses: on the S2 the arbiter gives Wi-Fi priority and reads fail or come back invalid.
+// Speed: IDF 4.4 continuous mode takes 611 to 83333 samples/s on the S2 (SOC_ADC_SAMPLE_FREQ_THRES_*),
+// 12 bits per sample (TYPE1 format, single unit). DMA (from SPI3) fills a byte ring; the HTTP task copies
+// it to PSRAM without masking interrupts, so Wi-Fi and the watchdog keep running.
+// Pin: the driver disables the pad's digital input and pulls (gpio_config MODE_DISABLE). No pull is
+// enabled. At the end the pin's IO_MUX register goes back to exactly what it was (input, pulls,
+// function), and the digital capture's dedicated GPIO bundle stays connected (input matrix untouched).
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -31,8 +31,8 @@ static const char *TAG = "ADC";
 
 #define ADC_MAX_SAMPLES 200000
 #define ADC_MAX_MS 10000
-#define ADC_CHUNK_BYTES 512   // bytes por interrupção do DMA (256 amostras, ~3 ms a 83 kHz)
-#define ADC_RING_BYTES 8192   // folga do anel (~50 ms a 83 kHz)
+#define ADC_CHUNK_BYTES 512   // bytes per DMA interrupt (256 samples, ~3 ms at 83 kHz)
+#define ADC_RING_BYTES 8192   // ring headroom (~50 ms at 83 kHz)
 #define TRIG_MAX_TIMEOUT_MS 300000
 
 typedef struct { const char *name; int gpio; int ch; int header_pin; } adc_pin_t;
@@ -41,18 +41,18 @@ static const adc_pin_t adc_pins[] = {
     { "IO1", 1, ADC1_CHANNEL_0, 10 },
     { "IO2", 2, ADC1_CHANNEL_1, 12 },
 };
-// Canais sem solda que são do ADC2 (só para a mensagem de erro)
+// Solder-free channels on ADC2 (only for the error message).
 static const char *adc2_names[] = { "IO11", "IO12", "IO13", "IO17", "IO18" };
 
-// Faixa recomendada pela IDF 4.4 para o S2 (mV) por atenuação; usada como fundo de escala nominal
-// quando o chip não tem calibração no eFuse
+// Range recommended by IDF 4.4 for the S2 (mV) per attenuation; used as the nominal full scale
+// when the chip has no eFuse calibration.
 typedef struct { const char *name; adc_atten_t atten; int range_mv; } atten_t;
 static const atten_t attens[] = {
     { "0", ADC_ATTEN_DB_0, 750 }, { "2.5", ADC_ATTEN_DB_2_5, 1050 }, { "6", ADC_ATTEN_DB_6, 1300 }, { "11", ADC_ATTEN_DB_11, 2500 },
 };
 
-// Taxa real no S2: o controlador digital roda a 5 MHz (APB/16) e dispara a cada 2*interval ciclos, com
-// interval = 2500000 / rate (inteiro). Uma amostra = 96 * interval ciclos da CPU de 240 MHz.
+// Real rate on the S2: the digital controller runs at 5 MHz (APB/16) and fires every 2*interval cycles,
+// with interval = 2500000 / rate (integer). One sample = 96 * interval cycles of the 240 MHz CPU.
 static inline uint32_t adc_interval(int rate) { return 2500000u / (uint32_t)rate; }
 static inline double adc_real_rate(int rate) { return 2500000.0 / adc_interval(rate); }
 
@@ -76,7 +76,7 @@ static bool is_adc2(const char *name) {
     return false;
 }
 
-// Conversão para mV: calibração de 2 pontos do eFuse (13 bits) se existir; senão, linear nominal.
+// Conversion to mV: 2-point eFuse calibration (13 bits) if present; otherwise nominal linear.
 static esp_adc_cal_characteristics_t cal_chars;
 static bool cal_ok = false;
 static int cal_range_mv = 2500;
@@ -86,8 +86,8 @@ static inline uint32_t raw_to_mv(uint32_t raw12) {
 }
 
 // GET /adc?pin=IO10&ms=100&rate=83333&atten=11[&trig_mv=1650&edge=fall|rise&timeout_ms=10000&pre=100]
-// Resposta: CSV "adc_samples v1": us,raw,mv (t=0 na 1a amostra, ou na amostra do trigger, com as do
-// pré-trigger negativas). raw = 12 bits (0..4095). No fim: amostras, taxa medida, falhas, status.
+// Reply: CSV "adc_samples v1": us,raw,mv (t=0 at the first sample, or at the trigger sample, with
+// pre-trigger samples negative). raw = 12 bits (0..4095). At the end: samples, measured rate, errors, status.
 static esp_err_t adc_handler(httpd_req_t *req) {
     char q[200] = "", tmp[32], pin[12] = "IO10", edge[8] = "fall", att[8] = "11";
     httpd_req_get_url_query_str(req, q, sizeof(q));
@@ -104,28 +104,28 @@ static esp_err_t adc_handler(httpd_req_t *req) {
     const adc_pin_t *p = find_pin(pin);
     if (!p) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST,
-                            is_adc2(pin) ? "pino do ADC2 (conflita com o Wi-Fi); use IO10, IO1 ou IO2 (ADC1)"
-                                         : "pin: use IO10, IO1 ou IO2 (ADC1)");
+                            is_adc2(pin) ? "ADC2 pin (conflicts with Wi-Fi); use IO10, IO1 or IO2 (ADC1)"
+                                         : "pin: use IO10, IO1 or IO2 (ADC1)");
         return ESP_OK;
     }
     const atten_t *a = NULL;
     for (size_t i = 0; i < sizeof(attens) / sizeof(attens[0]); i++)
         if (strcmp(att, attens[i].name) == 0) a = &attens[i];
-    if (!a) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "atten: 0, 2.5, 6 ou 11"); return ESP_OK; }
+    if (!a) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "atten: 0, 2.5, 6 or 11"); return ESP_OK; }
     if (rate < SOC_ADC_SAMPLE_FREQ_THRES_LOW || rate > SOC_ADC_SAMPLE_FREQ_THRES_HIGH) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "rate fora de 611..83333"); return ESP_OK;
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "rate outside 611..83333"); return ESP_OK;
     }
-    if (ms < 1 || ms > ADC_MAX_MS) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms fora de 1..10000"); return ESP_OK; }
+    if (ms < 1 || ms > ADC_MAX_MS) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms outside 1..10000"); return ESP_OK; }
     uint32_t n_want = (uint32_t)((int64_t)ms * rate / 1000);
     if (n_want < 1) n_want = 1;
-    if (n_want > ADC_MAX_SAMPLES) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms*rate acima de 200000 amostras"); return ESP_OK; }
+    if (n_want > ADC_MAX_SAMPLES) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms*rate above 200000 samples"); return ESP_OK; }
     pre = MAX(0, MIN(pre, ADC_CHUNK_BYTES / 2));
     timeout_ms = MAX(1, MIN(timeout_ms, TRIG_MAX_TIMEOUT_MS));
     bool rise = strcmp(edge, "rise") == 0;
 
-    if (capture_is_busy()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
+    if (capture_is_busy()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "busy (OTA)"); return ESP_OK; }
     record_discard_if_done();
-    if (!capture_lock(0)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
+    if (!capture_lock(0)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "another capture in progress"); return ESP_OK; }
 
     uint32_t n_buf = n_want + (trig_mv >= 0 ? (uint32_t)pre : 0);
     uint16_t *buf = heap_caps_malloc(n_buf * 2, MALLOC_CAP_SPIRAM);
@@ -133,21 +133,21 @@ static esp_err_t adc_handler(httpd_req_t *req) {
     uint8_t *chunk = heap_caps_malloc(ADC_CHUNK_BYTES, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!buf || !chunk) {
         free(buf); free(chunk); capture_unlock();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_OK;
     }
 
     cal_ok = esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK;
     if (cal_ok) esp_adc_cal_characterize(ADC_UNIT_1, a->atten, ADC_WIDTH_BIT_13, 0, &cal_chars);
     cal_range_mv = a->range_mv;
 
-    // Guarda o pad do pino inteiro (entrada, pulls, função) para devolver no fim
+    // Save the whole pad config (input, pulls, function) to restore at the end.
     uint32_t iomux_saved = REG_READ(GPIO_PIN_MUX_REG[p->gpio]);
 
     const char *status = "ok";
     uint32_t n = 0, invalid = 0, overflow = 0, chunks = 0;
     int32_t trig_idx = -1;
     int64_t t_first = 0, t_last = 0, t_arm = esp_timer_get_time();
-    uint32_t n_counted = 0;  // amostras vistas desde o 1o bloco (para a taxa medida)
+    uint32_t n_counted = 0;  // samples seen since the first block (for the measured rate)
 
     adc_digi_init_config_t ic = { .max_store_buf_size = ADC_RING_BYTES, .conv_num_each_intr = ADC_CHUNK_BYTES,
                                   .adc1_chan_mask = BIT(p->ch), .adc2_chan_mask = 0 };
@@ -182,7 +182,7 @@ static esp_err_t adc_handler(httpd_req_t *req) {
             const adc_digi_output_data_t *d = (const adc_digi_output_data_t *)chunk;
             uint32_t m = got / 2;
             if (!started) {
-                // procura o cruzamento do limiar neste bloco; guarda até `pre` amostras antes dele
+                // look for the threshold crossing in this block; keep up to `pre` samples before it
                 for (uint32_t i = 0; i < m; i++) {
                     if (d[i].type1.channel != p->ch) continue;
                     int mv = (int)raw_to_mv(d[i].type1.data);
@@ -241,7 +241,7 @@ static esp_err_t adc_handler(httpd_req_t *req) {
                    waited_us / 1000, err == ESP_OK ? "" : esp_err_to_name(err));
     httpd_resp_send_chunk(req, line, len);
     httpd_resp_send_chunk(req, NULL, 0);
-    ESP_LOGI(TAG, "adc %s %s: %lu amostras, %.0f amostras/s medidas, %lu invalidas", p->name, status, (unsigned long)n, sps,
+    ESP_LOGI(TAG, "adc %s %s: %lu samples, %.0f samples/s measured, %lu invalid", p->name, status, (unsigned long)n, sps,
              (unsigned long)invalid);
     free(buf);
     free(chunk);
@@ -250,10 +250,10 @@ static esp_err_t adc_handler(httpd_req_t *req) {
 }
 
 // ---------------------------------------------------------------------------------------------------
-// ADC em segundo plano para a captura combinada (/capture com adc_pin=): o DMA enche uma cadeia de 5
-// descritores em RAM interna sem precisar da CPU, enquanto o laço digital roda com as interrupções
-// mascaradas. A cadeia não é renovada durante a janela (a ISR do DMA está mascarada), então a parte
-// analógica cobre no máximo adc_bg_chain_samples() amostras a partir do último adc_bg_restart().
+// Background ADC for the combined capture (/capture with adc_pin=): DMA fills a chain of 5 descriptors
+// in internal RAM with no CPU help while the digital loop runs with interrupts masked. The chain is not
+// renewed during the window (the DMA ISR is masked), so the analog part covers at most
+// adc_bg_chain_samples() samples from the last adc_bg_restart().
 static const adc_pin_t *bg_pin = NULL;
 static uint32_t bg_iomux = 0, bg_chunk = 0;
 static int bg_rate = 0;
@@ -264,22 +264,22 @@ static adc_digi_configuration_t bg_dc;
 
 const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_digital) {
     const adc_pin_t *p = find_pin(pin);
-    if (!p) return is_adc2(pin) ? "adc_pin do ADC2 (conflita com o Wi-Fi); use IO1, IO2 ou IO10" : "adc_pin: use IO1, IO2 ou IO10";
+    if (!p) return is_adc2(pin) ? "adc_pin on ADC2 (conflicts with Wi-Fi); use IO1, IO2 or IO10" : "adc_pin: use IO1, IO2 or IO10";
     const atten_t *a = NULL;
     for (size_t i = 0; i < sizeof(attens) / sizeof(attens[0]); i++)
         if (strcmp(atten, attens[i].name) == 0) a = &attens[i];
-    if (!a) return "adc_atten: 0, 2.5, 6 ou 11";
-    if (rate < SOC_ADC_SAMPLE_FREQ_THRES_LOW || rate > SOC_ADC_SAMPLE_FREQ_THRES_HIGH) return "adc_rate fora de 611..83333";
-    // Cadeia = 5 blocos em RAM interna (DMA). Deixa ~12 KB de folga para o Wi-Fi; bloco de 256 a 4092 bytes.
+    if (!a) return "adc_atten: 0, 2.5, 6 or 11";
+    if (rate < SOC_ADC_SAMPLE_FREQ_THRES_LOW || rate > SOC_ADC_SAMPLE_FREQ_THRES_HIGH) return "adc_rate outside 611..83333";
+    // Chain = 5 blocks in internal RAM (DMA). Leaves ~12 KB for Wi-Fi; blocks of 256 to 4092 bytes.
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     int32_t chunk = largest > 12 * 1024 ? (int32_t)(largest - 12 * 1024) / 5 : 0;
     chunk = MIN(chunk, 4092) & ~3;
-    if (chunk < 256) return "adc: pouca RAM interna para o DMA";
+    if (chunk < 256) return "adc: not enough internal RAM for DMA";
     cal_ok = esp_adc_cal_check_efuse(ESP_ADC_CAL_VAL_EFUSE_TP) == ESP_OK;
     if (cal_ok) esp_adc_cal_characterize(ADC_UNIT_1, a->atten, ADC_WIDTH_BIT_13, 0, &cal_chars);
     cal_range_mv = a->range_mv;
     bg_iomux = REG_READ(GPIO_PIN_MUX_REG[p->gpio]);
-    // anel > 16 KB para ir para a PSRAM; cabe a cadeia inteira de uma vez (a ISR despeja tudo ao desmascarar)
+    // ring > 16 KB so it goes to PSRAM; holds the whole chain at once (the ISR dumps it all on unmask)
     bg_ic = (adc_digi_init_config_t){ .max_store_buf_size = MAX(17 * 1024, 6 * (uint32_t)chunk), .conv_num_each_intr = (uint32_t)chunk,
                                       .adc1_chan_mask = BIT(p->ch), .adc2_chan_mask = 0 };
     bg_pat = (adc_digi_pattern_config_t){ .atten = a->atten, .channel = p->ch, .unit = 0, .bit_width = SOC_ADC_DIGI_MAX_BITWIDTH };
@@ -292,10 +292,10 @@ const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_
         adc_digi_deinitialize();
         REG_WRITE(GPIO_PIN_MUX_REG[p->gpio], bg_iomux);
         ESP_LOGE(TAG, "adc_bg: %s", esp_err_to_name(err));
-        return "adc: falha ao iniciar o DMA";
+        return "adc: failed to start DMA";
     }
-    // keep_digital: devolve a entrada digital (e os pulls do /capture) ao pad, para o mesmo pino servir
-    // também de canal digital. Experimental: o ADC lê o pad com o buffer digital ligado.
+    // keep_digital: give the digital input (and the /capture pulls) back to the pad, so the same pin
+    // also works as a digital channel. Experimental: the ADC reads the pad with the digital buffer on.
     if (keep_digital) REG_WRITE(GPIO_PIN_MUX_REG[p->gpio], bg_iomux);
     bg_keep_digital = keep_digital;
     bg_alive = true;
@@ -308,11 +308,11 @@ const char *adc_bg_open(const char *pin, int rate, const char *atten, bool keep_
 uint32_t adc_bg_chain_samples(void) { return bg_pin ? bg_chunk * 5 / 2 : 0; }
 uint32_t adc_bg_period_cycles(void) { return bg_pin ? 96u * adc_interval(bg_rate) : 0; }
 
-// Recomeça uma cadeia nova, descartando o que havia. *t0 = ciclo da CPU logo depois de ligar o disparo
-// (a 1a amostra sai ~1 período depois). Não usa adc_digi_stop + adc_digi_start + leitura para esvaziar:
-// depois de um stop no meio de um bloco, o anel do driver da IDF 4.4 fica com pedaços de tamanho que não
-// é múltiplo de 4 e adc_digi_read_bytes dá assert ((size % 4) == 0) -> panic (visto no 0.3.1/0.3.2).
-// Em vez disso, desmonta e remonta o driver (o anel é apagado sem ser lido), ~1 ms.
+// Starts a new chain, dropping what was there. *t0 = CPU cycle right after the trigger is enabled
+// (the first sample comes ~1 period later). It does not use adc_digi_stop + adc_digi_start + a read to
+// drain: after a stop in the middle of a block, the IDF 4.4 driver ring holds pieces whose size is not
+// a multiple of 4 and adc_digi_read_bytes asserts ((size % 4) == 0) -> panic (seen in 0.3.1/0.3.2).
+// Instead the driver is uninstalled and installed again (the ring is cleared unread), ~1 ms.
 void adc_bg_restart(uint32_t *t0) {
     if (!bg_pin) return;
     if (bg_started) {
@@ -323,7 +323,7 @@ void adc_bg_restart(uint32_t *t0) {
         bg_alive = false;
         if (adc_digi_initialize(&bg_ic) != ESP_OK || adc_digi_controller_configure(&bg_dc) != ESP_OK) {
             adc_digi_deinitialize();
-            ESP_LOGE(TAG, "adc_bg: falha ao remontar");
+            ESP_LOGE(TAG, "adc_bg: reinstall failed");
             *t0 = cpu_hal_get_cycle_count();
             return;
         }
@@ -336,7 +336,7 @@ void adc_bg_restart(uint32_t *t0) {
     *t0 = cpu_hal_get_cycle_count();
 }
 
-// Lê até n amostras da cadeia (espera no máx. timeout_ms). Devolve quantas; *invalid = descartadas.
+// Reads up to n samples from the chain (waits at most timeout_ms). Returns how many; *invalid = dropped.
 uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t *invalid) {
     static uint8_t chunk[512];
     uint32_t k = 0;
@@ -354,9 +354,9 @@ uint32_t adc_bg_collect(uint16_t *buf, uint32_t n, uint32_t timeout_ms, uint32_t
     return k;
 }
 
-// Uma leitura do anel (modo contínuo, sem stop no meio): até max amostras, espera até timeout_ms.
+// One ring read (continuous mode, no stop in between): up to max samples, waits up to timeout_ms.
 uint32_t adc_bg_read(uint16_t *buf, uint32_t max, uint32_t timeout_ms, uint32_t *invalid) {
-    static uint8_t *chunk = NULL;  // PSRAM: a RAM interna é pouca
+    static uint8_t *chunk = NULL;  // PSRAM: internal RAM is short
     const uint32_t CHUNK = 1024;
     if (!chunk) chunk = heap_caps_malloc(CHUNK, MALLOC_CAP_SPIRAM);
     if (!chunk || !bg_pin || !bg_alive || !bg_started) return 0;
@@ -375,7 +375,7 @@ uint32_t adc_bg_read(uint16_t *buf, uint32_t max, uint32_t timeout_ms, uint32_t 
 
 uint32_t adc_bg_mv(uint32_t raw) { return raw_to_mv(raw); }
 
-// Cabeçalho da seção analógica do CSV combinado
+// Header of the analog section in the combined CSV.
 int adc_bg_header(char *out, size_t n) {
     if (!bg_pin) return 0;
     return snprintf(out, n, "# adc_samples v1 pin=%s gpio=%d header_pin=%d unit=1 ch=%d atten_range_mv=%d rate=%d rate_real=%.1f "

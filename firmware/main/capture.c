@@ -1,14 +1,14 @@
-// Captura de bordas nos 8 canais sem solda da devboard.
+// Edge capture on the 8 devboard channels that need no soldering.
 //
-// Método: os 8 GPIOs viram um "bundle" de GPIO dedicado do ESP32-S2 (instrução get_gpio_in, 1 ciclo,
-// lê os 8 de uma vez). Um laço em IRAM, com interrupções mascaradas, lê os pinos e o contador de ciclos
-// (240 MHz, 4,17 ns) e grava só as mudanças. Cada volta do laço leva poucos ciclos (o max_gap_cycles do
-// CSV diz quanto), então a resolução é de dezenas de ns, bem melhor que 1 µs.
-// Trigger (padrão tmode=poll): o mesmo laço espera a borda em fatias de 100 ms com interrupções mascaradas
-// (latência ~0,1 µs; ~1% do tempo cego, nas pausas de 1 ms para o Wi-Fi). tmode=isr: interrupção de GPIO,
-// Wi-Fi livre na espera, mas ~1 a 2 µs de latência. Sem trigger, a captura começa na hora.
-// Limites: janela de até CAP_MAX_MS (Wi-Fi e ticks ficam parados durante a janela) e o buffer de bordas
-// (RAM interna livre). Sem pré-trigger por enquanto.
+// The 8 GPIOs form an ESP32-S2 dedicated GPIO bundle (get_gpio_in reads all 8 in 1 cycle). A loop in
+// IRAM, with interrupts masked, reads the pins and the cycle counter (240 MHz, 4.17 ns) and stores only
+// the changes. Each pass takes a few cycles (max_gap_cycles in the CSV says how many), so the resolution
+// is tens of ns.
+// Trigger (default tmode=poll): the same loop waits for the edge in 100 ms slices with interrupts masked
+// (~0.1 us latency; blind ~1% of the time, during the 1 ms breaks left for Wi-Fi). tmode=isr: GPIO
+// interrupt, Wi-Fi free while waiting, but 1 to 2 us latency. Without a trigger, capture starts at once.
+// Limits: window up to CAP_MAX_MS (Wi-Fi and ticks stop during the window) and the edge buffer
+// (free internal RAM, or PSRAM). No pre-trigger yet.
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -46,7 +46,7 @@ static const char *TAG = "CAP";
 #define TRIG_MAX_TIMEOUT_MS 300000
 #define POLL_SLICE_MS 100
 
-// Ordem dos canais = bits do bundle. Nome = rótulo na devboard. Pino = número no header do Flipper.
+// Channel order = bundle bits. Name = devboard label. Pin = position on the Flipper header.
 static const int ch_gpio[N_CH] = { 10, 11, 12, 13, 1, 2, 18, 17 };
 static const char *ch_name[N_CH] = { "IO10", "IO11", "IO12", "IO13", "IO1", "IO2", "IO18", "IO17" };
 static const int ch_header_pin[N_CH] = { 5, 2, 4, 3, 10, 12, 15, 16 };
@@ -56,10 +56,10 @@ static SemaphoreHandle_t cap_lock = NULL;
 static bool (*busy_check)(void) = NULL;
 static bool (*auth_check)(httpd_req_t *) = NULL;
 
-// Estado de uma captura (usado dentro da ISR: tudo em DRAM)
+// Capture state (used inside the ISR, so all in DRAM).
 typedef struct {
-    uint32_t *t;        // ciclos desde o início
-    uint8_t *v;         // nível dos 8 canais depois da borda
+    uint32_t *t;        // cycles since start
+    uint8_t *v;         // level of the 8 channels after the edge
     uint32_t max_edges;
     uint32_t n;
     uint32_t overflow;
@@ -68,7 +68,7 @@ typedef struct {
     uint32_t loops;
     uint8_t initial;
     uint8_t final;
-    int trig_ch;        // -1 = sem trigger
+    int trig_ch;        // -1 = no trigger
     volatile bool done;
     SemaphoreHandle_t done_sem;
 } cap_t;
@@ -76,8 +76,8 @@ static DRAM_ATTR cap_t cap;
 
 static inline uint32_t IRAM_ATTR read_in(void) { return cpu_ll_read_dedic_gpio_in() & 0xFF; }
 
-// O laço quente. Chamado com interrupções mascaradas. start: ciclo do t=0. first_in >= 0: grava esse
-// valor como a primeira borda em t=0 (a borda do trigger detectada pelo laço de espera).
+// The hot loop. Called with interrupts masked. start: cycle of t=0. first_in >= 0: stores that value
+// as the first edge at t=0 (the trigger edge found by the wait loop).
 static void IRAM_ATTR __attribute__((noinline)) capture_loop(uint32_t last, uint32_t start, int first_in) {
     uint32_t *t = cap.t;
     uint8_t *v = cap.v;
@@ -111,9 +111,10 @@ static void IRAM_ATTR __attribute__((noinline)) capture_loop(uint32_t last, uint
     cap.final = (uint8_t)last;
 }
 
-// Espera o trigger lendo os pinos no mesmo laço apertado (latência de ~0,1 µs), por no máximo slice
-// ciclos. Devolve 0 se não veio; 1 se veio (em *t_trig, com *in_trig = valor depois da borda e *plast =
-// valor antes); 2 se já veio na 1a leitura (a borda pode ter ocorrido na pausa entre fatias).
+// Waits for the trigger by reading the pins in the same tight loop (~0.1 us latency), for at most
+// slice cycles. Returns 0 if it did not come; 1 if it did (at *t_trig, with *in_trig = value after the
+// edge and *plast = value before); 2 if it was already there on the first read (the edge may have
+// happened in the break between slices).
 enum { EDGE_ANY = 0, EDGE_RISE = 1, EDGE_FALL = 2 };
 static int IRAM_ATTR __attribute__((noinline)) wait_trigger(uint32_t *plast, uint32_t bit, int edge, uint32_t slice, uint32_t *t_trig,
                                   uint32_t *in_trig) {
@@ -137,7 +138,7 @@ static int IRAM_ATTR __attribute__((noinline)) wait_trigger(uint32_t *plast, uin
     }
 }
 
-// Desliga a interrupção do pino direto no registrador (seguro dentro da ISR)
+// Disables the pin interrupt straight in the register (safe inside the ISR).
 static inline void IRAM_ATTR gpio_ll_intr_disable_irq(int gpio) { GPIO.pin[gpio].int_type = 0; }
 
 static void IRAM_ATTR trigger_isr(void *arg) {
@@ -167,7 +168,7 @@ esp_err_t capture_init(bool (*is_busy)(void), bool (*auth)(httpd_req_t *)) {
     if (err != ESP_OK) { ESP_LOGE(TAG, "bundle: %s", esp_err_to_name(err)); return err; }
     err = gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
     if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
-    ESP_LOGI(TAG, "8 canais prontos (dedicated GPIO)");
+    ESP_LOGI(TAG, "8 channels ready (dedicated GPIO)");
     return ESP_OK;
 }
 
@@ -208,7 +209,7 @@ static bool qparam(const char *q, const char *key, char *out, size_t n) {
     return q && httpd_query_key_value(q, key, out, n) == ESP_OK;
 }
 
-// GET /levels: nível atual de cada canal
+// GET /levels: current level of each channel
 static esp_err_t levels_handler(httpd_req_t *req) {
     char q[64] = "", pull[8] = "";
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK && qparam(q, "pull", pull, sizeof(pull)))
@@ -225,7 +226,7 @@ static esp_err_t levels_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// GET /channels: mapa de canais
+// GET /channels: channel map
 static esp_err_t channels_handler(httpd_req_t *req) {
     char buf[600];
     int len = snprintf(buf, sizeof(buf), "{\"ok\":true,\"cpu_hz\":%u,\"max_ms\":%d,\"channels\":[", CPU_HZ, CAP_MAX_MS);
@@ -240,12 +241,12 @@ static esp_err_t channels_handler(httpd_req_t *req) {
 
 // GET /capture?ms=100&trigger=IO10&edge=fall|rise|any&timeout_ms=10000&pull=up|down|none&pins=IO10,IO11
 //              [&adc_pin=IO1&adc_rate=20000&adc_atten=11]
-// Resposta: CSV no formato gpio_edges v1 (o mesmo do projeto do Flipper), com cpu_hz=240000000.
-// Com adc_pin (captura combinada): o ADC1 amostra esse pino por DMA durante a janela digital e o CSV
-// ganha, depois do "# end", uma seção "# adc_samples v1 ... t0=digital" com cycles,raw,mv, em ciclos
-// de 240 MHz desde o MESMO t0 das bordas (negativos = antes do trigger). A cadeia de DMA cobre no
-// máximo "chain" amostras; com trigger por varredura, a fatia de espera encolhe para que ao menos
-// min(ms, metade da cadeia) fique depois do trigger. Só tmode=poll (ou sem trigger).
+// Reply: CSV in gpio_edges v1 format (same as the Flipper FAP), with cpu_hz=240000000.
+// With adc_pin (combined capture): ADC1 samples that pin over DMA during the digital window and the CSV
+// gets, after "# end", a "# adc_samples v1 ... t0=digital" section with cycles,raw,mv, in 240 MHz
+// cycles from the SAME t0 as the edges (negative = before the trigger). The DMA chain covers at most
+// "chain" samples; with the polling trigger, the wait slice shrinks so that at least
+// min(ms, half the chain) lands after the trigger. tmode=poll only (or no trigger).
 static esp_err_t capture_handler(httpd_req_t *req) {
     char q[240] = "", tmp[64];
     httpd_req_get_url_query_str(req, q, sizeof(q));
@@ -264,29 +265,29 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     if (qparam(q, "adc_rate", tmp, sizeof(tmp))) adc_rate = atoi(tmp);
     bool use_adc = adc_pin[0] != 0;
     if (use_adc && trig >= 0 && strcmp(tmode, "isr") == 0) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "adc_pin: so com tmode=poll ou sem trigger"); return ESP_OK;
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "adc_pin: only with tmode=poll or no trigger"); return ESP_OK;
     }
     if (qparam(q, "trigger", tmp, sizeof(tmp)) && tmp[0]) {
         trig = ch_index(tmp);
-        if (trig < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "trigger: canal invalido"); return ESP_OK; }
+        if (trig < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "trigger: invalid channel"); return ESP_OK; }
     }
-    if (ms < 1 || ms > CAP_MAX_MS) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms fora de 1..2000"); return ESP_OK; }
+    if (ms < 1 || ms > CAP_MAX_MS) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "ms outside 1..2000"); return ESP_OK; }
     timeout_ms = MAX(1, MIN(timeout_ms, TRIG_MAX_TIMEOUT_MS));
     uint8_t mask = 0;
     if (pins[0]) {
         char *save = NULL;
         for (char *p = strtok_r(pins, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
             int i = ch_index(p);
-            if (i < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins: canal invalido"); return ESP_OK; }
+            if (i < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins: invalid channel"); return ESP_OK; }
             mask |= 1 << i;
         }
     } else mask = 0xFF;
-    if (busy_check && busy_check()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
+    if (busy_check && busy_check()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "busy (OTA)"); return ESP_OK; }
     record_discard_if_done();
-    if (xSemaphoreTake(cap_lock, 0) != pdTRUE) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
+    if (xSemaphoreTake(cap_lock, 0) != pdTRUE) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "another capture in progress"); return ESP_OK; }
 
-    // Buffer: o maior bloco livre de RAM interna, deixando folga para Wi-Fi e HTTP. Se não couber
-    // (placa WROVER: Wi-Fi e cache da PSRAM comem a RAM interna), usa a PSRAM.
+    // Buffer: the largest free internal RAM block, leaving room for Wi-Fi and HTTP. If it does not
+    // fit (WROVER board: Wi-Fi and the PSRAM cache eat internal RAM), PSRAM is used.
     size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
     size_t budget = largest > 40 * 1024 ? largest - 32 * 1024 : 0;
     uint32_t max_edges = budget / 5;
@@ -299,14 +300,14 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         if (pe > max_edges) { max_edges = pe; caps_extra = MALLOC_CAP_SPIRAM; }
     }
     const char *bufkind = caps_extra == MALLOC_CAP_SPIRAM ? "psram" : "internal";
-    ESP_LOGI(TAG, "captura: buffer %s, %lu bordas (int livre %u, maior bloco %u)", bufkind,
+    ESP_LOGI(TAG, "capture: buffer %s, %lu edges (internal free %u, largest block %u)", bufkind,
              (unsigned long)max_edges, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)largest);
-    if (max_edges < 256) { xSemaphoreGive(cap_lock); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK; }
+    if (max_edges < 256) { xSemaphoreGive(cap_lock); httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_OK; }
     uint32_t *tbuf = heap_caps_malloc(max_edges * 4, MALLOC_CAP_32BIT | caps_extra);
     uint8_t *vbuf = heap_caps_malloc(max_edges, MALLOC_CAP_8BIT | caps_extra);
     if (!tbuf || !vbuf) {
         free(tbuf); free(vbuf); xSemaphoreGive(cap_lock);
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_OK;
     }
 
     apply_pull(pull);
@@ -320,14 +321,14 @@ static esp_err_t capture_handler(httpd_req_t *req) {
             a_period = adc_bg_period_cycles();
             abuf = heap_caps_malloc(a_chain * 2, MALLOC_CAP_SPIRAM);
             if (!abuf) abuf = heap_caps_malloc(a_chain * 2, MALLOC_CAP_8BIT);
-            if (!abuf) aerr = "adc: sem memoria";
+            if (!abuf) aerr = "adc: out of memory";
         }
         if (aerr) {
             adc_bg_close(); free(abuf); free(tbuf); free(vbuf); xSemaphoreGive(cap_lock);
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, aerr); return ESP_OK;
         }
     }
-    vTaskDelay(pdMS_TO_TICKS(2));  // pull assentar
+    vTaskDelay(pdMS_TO_TICKS(2));  // let the pull settle
     cap.n = 0; cap.overflow = 0; cap.max_gap = 0; cap.loops = 0; cap.final = 0;
     cap.t = tbuf; cap.v = vbuf; cap.max_edges = max_edges;
     cap.win_cycles = (uint32_t)ms * (CPU_HZ / 1000);
@@ -340,8 +341,8 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     int64_t waited_us = 0;
 
     int edge_code = strcmp(edge, "rise") == 0 ? EDGE_RISE : strcmp(edge, "fall") == 0 ? EDGE_FALL : EDGE_ANY;
-    // Fatia da espera por varredura: com ADC, curta o bastante para a cadeia de DMA (renovada a cada
-    // fatia) ainda cobrir min(ms, metade da cadeia) depois do trigger
+    // Polling wait slice: with the ADC on, short enough for the DMA chain (renewed every slice)
+    // to still cover min(ms, half the chain) after the trigger.
     uint32_t slice = POLL_SLICE_MS * (CPU_HZ / 1000);
     if (use_adc) {
         uint64_t chain_cyc = (uint64_t)a_chain * a_period;
@@ -359,14 +360,14 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         XTOS_RESTORE_INTLEVEL(ps);
         cap.done = true;
     } else if (strcmp(tmode, "isr") == 0) {
-        // Trigger por interrupção: Wi-Fi livre durante a espera, mas ~1 a 2 µs de latência (pode perder
-        // pulsos de bounce mais curtos que isso logo no começo)
+        // Interrupt trigger: Wi-Fi is free while waiting, but latency is 1 to 2 us (bounce pulses
+        // shorter than that right at the start can be missed).
         gpio_int_type_t it = edge_code == EDGE_RISE ? GPIO_INTR_POSEDGE : edge_code == EDGE_FALL ? GPIO_INTR_NEGEDGE : GPIO_INTR_ANYEDGE;
         cap.initial = read_in();
         gpio_isr_handler_add(ch_gpio[trig], trigger_isr, NULL);
         gpio_set_intr_type(ch_gpio[trig], it);
         gpio_intr_enable(ch_gpio[trig]);
-        // espera em pedaços de 500 ms para notar cliente que desistiu
+        // wait in 500 ms pieces to notice a client that gave up
         bool got = false, gone = false;
         for (int64_t end = t_arm + (int64_t)timeout_ms * 1000; !got && esp_timer_get_time() < end;) {
             got = xSemaphoreTake(cap.done_sem, pdMS_TO_TICKS(500)) == pdTRUE;
@@ -379,9 +380,9 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         gpio_intr_disable(ch_gpio[trig]);
         gpio_isr_handler_remove(ch_gpio[trig]);
     } else {
-        // Trigger por varredura (padrão): espera no laço apertado em fatias de POLL_SLICE_MS com as
-        // interrupções mascaradas, soltando ~1 ms entre fatias para o Wi-Fi respirar. Latência ~0,1 µs.
-        // Se a borda cair na pausa, é vista no começo da fatia seguinte (status=trigger_in_gap).
+        // Polling trigger (default): wait in the tight loop in POLL_SLICE_MS slices with interrupts
+        // masked, releasing ~1 ms between slices for Wi-Fi. Latency ~0.1 us. If the edge lands in a
+        // break, it is seen at the start of the next slice (status=trigger_in_gap).
         uint32_t last = read_in(), t_trig = 0, in_trig = 0;
         cap.initial = last;
         int64_t deadline = t_arm + (int64_t)timeout_ms * 1000;
@@ -406,10 +407,10 @@ static esp_err_t capture_handler(httpd_req_t *req) {
             if (r) break;
             vTaskDelay(1);
         }
-        // fração do tempo de espera em que o pino NÃO estava sendo olhado (pausas + remontagem do ADC)
+        // fraction of the wait when the pin was NOT being watched (breaks + ADC reinstall)
         int64_t waited = esp_timer_get_time() - t_arm;
         blind_pct = waited > 0 ? 100.0 * (double)(waited - masked_us) / (double)waited : 0;
-        ESP_LOGI(TAG, "espera: %d fatias, %.1f%% cego, remontagem do ADC %lld us por fatia", slices, blind_pct,
+        ESP_LOGI(TAG, "wait: %d slices, %.1f%% blind, ADC reinstall %lld us per slice", slices, blind_pct,
                  slices ? restart_us / slices : 0);
         t_zero = t_trig;
         if (!r && strcmp(status, "client_gone") != 0) status = "timeout";
@@ -420,7 +421,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     if (cap.overflow) status = "overflow";
     diag_mark("cap:csv");
     if (strcmp(status, "client_gone") == 0) {
-        ESP_LOGW(TAG, "captura cancelada: cliente desconectou");
+        ESP_LOGW(TAG, "capture cancelled: client disconnected");
         if (use_adc) { adc_bg_close(); free(abuf); }
         free(tbuf); free(vbuf); xSemaphoreGive(cap_lock); diag_mark("");
         return ESP_OK;
@@ -461,7 +462,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
                    (unsigned long)cap.loops, (unsigned long)max_edges, bufkind, waited_us / 1000, blind_pct);
     httpd_resp_send_chunk(req, line, len);
     if (use_adc) {
-        // Amostras da cadeia que caem até o fim da janela; a amostra i sai em t_adc0 + (i+1) períodos
+        // Chain samples up to the end of the window; sample i comes out at t_adc0 + (i+1) periods
         int64_t until = (int64_t)(int32_t)(t_zero - t_adc0) + cap.win_cycles;
         uint32_t n_keep = until > 0 ? (uint32_t)MIN((uint64_t)a_chain, (uint64_t)until / a_period) : 0;
         if (strcmp(status, "timeout") == 0) n_keep = 0;
@@ -469,7 +470,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
         uint32_t chunk_ms = (uint32_t)((uint64_t)a_chain / 5 * a_period / (CPU_HZ / 1000));
         diag_mark("cap:adc_collect");
         uint32_t a_n = adc_bg_collect(abuf, n_keep, chunk_ms + 300, &a_invalid);
-        len = adc_bg_header(line, sizeof(line));  // antes do close (o close esquece o pino e a taxa)
+        len = adc_bg_header(line, sizeof(line));  // before close (close forgets the pin and rate)
         diag_mark("cap:adc_close");
         adc_bg_close();
         if (len <= 0) len = snprintf(line, sizeof(line), "# adc_samples v1 pin=%s t0=digital\n", adc_pin);
@@ -491,7 +492,7 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     }
     httpd_resp_send_chunk(req, NULL, 0);
     diag_mark("");
-    ESP_LOGI(TAG, "captura %s: %lu bordas, %lu voltas, gap max %lu ciclos", status, (unsigned long)edges_out,
+    ESP_LOGI(TAG, "capture %s: %lu edges, %lu loops, max gap %lu cycles", status, (unsigned long)edges_out,
              (unsigned long)cap.loops, (unsigned long)cap.max_gap);
     free(tbuf);
     free(vbuf);
@@ -499,19 +500,20 @@ static esp_err_t capture_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// POST /gen: gerador de teste num canal, com a entrada ligada no mesmo pino, para o analisador se
-// medir sozinho, sem nada externo. NÃO usar com sinal externo ligado ao pino (curto entre saídas).
-//   /gen?pin=IO10&hz=1000&duty=50              onda quadrada contínua (LEDC); hz=0 desliga tudo
-//   /gen?pin=IO10&mode=bounce&delay_ms=1000    uma rajada que imita um botão com bounce (RMT, 1 µs
-//                                              exato), disparada delay_ms depois (para dar tempo de
-//                                              armar um /capture com trigger)
-// Padrão do bounce (µs, a partir do repouso em 1): ver bounce_pattern.
+// POST /gen: test generator on a channel, with the input still enabled on the same pin, so the
+// analyzer can measure itself with nothing external. Do NOT use with an external signal on the pin
+// (two outputs shorted).
+//   /gen?pin=IO10&hz=1000&duty=50              continuous square wave (LEDC); hz=0 turns it all off
+//   /gen?pin=IO10&mode=bounce&delay_ms=1000    one burst that mimics a bouncing button (RMT, 1 us
+//                                              exact), fired delay_ms later (time to arm a
+//                                              /capture with trigger)
+// Bounce pattern (us, starting from idle at 1): see bounce_pattern.
 static int gen_pin = -1;
 static enum { GEN_OFF, GEN_LEDC, GEN_RMT } gen_mode = GEN_OFF;
 static esp_timer_handle_t gen_timer = NULL;
 static rmt_item32_t bounce_items[24];
 static int bounce_n = 0;
-// nível, duração em µs. Pressão (6 bordas de bounce, depois 20 ms em 0), soltura (5 bordas, volta a 1)
+// level, duration in us. Press (6 bounce edges, then 20 ms at 0), release (5 edges, back to 1).
 static const int16_t bounce_pattern[][2] = {
     {0, 3}, {1, 5}, {0, 12}, {1, 8}, {0, 40}, {1, 25}, {0, 20000},
     {1, 4}, {0, 6}, {1, 15}, {0, 10}, {1, 60},
@@ -523,7 +525,7 @@ static void gen_release(void) {
     if (gen_pin >= 0) {
         gpio_reset_pin(gen_pin);
         gpio_set_direction(gen_pin, GPIO_MODE_INPUT);
-        // devolve o pino ao bundle (o reset desfaz a ligação de entrada da matriz)
+        // give the pin back to the bundle (the reset undoes the matrix input routing)
         dedic_gpio_del_bundle(bundle);
         dedic_gpio_bundle_config_t cfg = { .gpio_array = ch_gpio, .array_size = N_CH, .flags = { .in_en = 1 } };
         dedic_gpio_new_bundle(&cfg, &bundle);
@@ -545,14 +547,14 @@ static esp_err_t gen_handler(httpd_req_t *req) {
     int delay_ms = qparam(q, "delay_ms", tmp, sizeof(tmp)) ? atoi(tmp) : 500;
     int ch = qparam(q, "pin", tmp, sizeof(tmp)) ? ch_index(tmp) : 0;
     qparam(q, "mode", mode, sizeof(mode));
-    if (ch < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pin invalido"); return ESP_OK; }
+    if (ch < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid pin"); return ESP_OK; }
     if (gen_timer) esp_timer_stop(gen_timer);
     gen_release();
     char buf[200];
     httpd_resp_set_type(req, "application/json");
     if (strcmp(mode, "bounce") == 0) {
         rmt_config_t rc = RMT_DEFAULT_CONFIG_TX(ch_gpio[ch], RMT_CHANNEL_0);
-        rc.clk_div = 80;  // APB 80 MHz / 80 = 1 µs por tick
+        rc.clk_div = 80;  // APB 80 MHz / 80 = 1 us per tick
         rc.tx_config.idle_output_en = true;
         rc.tx_config.idle_level = RMT_IDLE_LEVEL_HIGH;
         rc.tx_config.carrier_en = false;
@@ -561,9 +563,9 @@ static esp_err_t gen_handler(httpd_req_t *req) {
         }
         int np = sizeof(bounce_pattern) / sizeof(bounce_pattern[0]);
         bounce_n = 0;
-        // 50 ms em repouso (alto) feitos pelo próprio RMT antes da rajada: o esp_timer que dispara o RMT
-        // só roda quando as interrupções voltam (na pausa de 1 ms do trigger por varredura), então sem
-        // este atraso de hardware a 1a borda cairia sempre na pausa (status trigger_in_gap).
+        // 50 ms idle (high) generated by the RMT itself before the burst: the esp_timer that starts the
+        // RMT only runs when interrupts come back (in the 1 ms break of the polling trigger), so without
+        // this hardware delay the first edge would always land in the break (status trigger_in_gap).
         bounce_items[bounce_n++] = (rmt_item32_t){ .level0 = 1, .duration0 = 25000, .level1 = 1, .duration1 = 25000 };
         for (int i = 0; i < np; i += 2) {
             rmt_item32_t it = { .level0 = bounce_pattern[i][0], .duration0 = bounce_pattern[i][1] };
@@ -572,8 +574,8 @@ static esp_err_t gen_handler(httpd_req_t *req) {
             bounce_items[bounce_n++] = it;
         }
         if (np % 2 == 0) bounce_items[bounce_n++] = (rmt_item32_t){ .level0 = 1, .duration0 = 0, .level1 = 1, .duration1 = 0 };
-        // religa só a entrada do pad (o bundle lê o próprio sinal). gpio_set_direction(INPUT_OUTPUT)
-        // NÃO serve: reconecta o pad ao sinal GPIO simples e desliga o RMT/LEDC (pino fica fixo).
+        // re-enable only the pad input (the bundle reads its own signal). gpio_set_direction(INPUT_OUTPUT)
+        // does NOT work: it routes the pad back to the plain GPIO signal and cuts RMT/LEDC (pin stuck).
         PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ch_gpio[ch]]);
         gen_pin = ch_gpio[ch];
         gen_mode = GEN_RMT;
@@ -596,12 +598,12 @@ static esp_err_t gen_handler(httpd_req_t *req) {
     ledc_timer_config_t tc = { .speed_mode = LEDC_LOW_SPEED_MODE, .timer_num = LEDC_TIMER_0,
                                .duty_resolution = LEDC_TIMER_8_BIT, .freq_hz = hz, .clk_cfg = LEDC_AUTO_CLK };
     if (hz > 150000) tc.duty_resolution = LEDC_TIMER_4_BIT;
-    if (ledc_timer_config(&tc) != ESP_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "frequencia invalida"); return ESP_OK; }
+    if (ledc_timer_config(&tc) != ESP_OK) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid frequency"); return ESP_OK; }
     uint32_t full = 1u << tc.duty_resolution;
     ledc_channel_config_t cc = { .gpio_num = ch_gpio[ch], .speed_mode = LEDC_LOW_SPEED_MODE, .channel = LEDC_CHANNEL_0,
                                  .timer_sel = LEDC_TIMER_0, .duty = full * duty / 100, .hpoint = 0 };
     ledc_channel_config(&cc);
-    PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ch_gpio[ch]]);  // ver comentário no modo bounce
+    PIN_INPUT_ENABLE(GPIO_PIN_MUX_REG[ch_gpio[ch]]);  // see the comment in bounce mode
     gen_pin = ch_gpio[ch];
     gen_mode = GEN_LEDC;
     snprintf(buf, sizeof(buf), "{\"ok\":true,\"gen\":\"%s\",\"mode\":\"square\",\"hz\":%lu,\"duty\":%d}\n", ch_name[ch],

@@ -1,18 +1,18 @@
-// Gravação contínua para testes de bancada (/record): uma janela longa (até REC_MAX_S) sem rearmar.
+// Continuous recording for bench tests (/record): one long window (up to REC_MAX_S) with no re-arming.
 //
-// Diferente do /capture (laço com interrupções mascaradas, no máx. 2 s), aqui o laço de varredura roda
-// numa tarefa de prioridade 1 com as interrupções LIGADAS: Wi-Fi, HTTP e watchdog seguem vivos, e o
-// cliente consulta o progresso (/record/status) enquanto grava. Preço: quando uma interrupção ou
-// tarefa mais alta toma a CPU, o laço para por alguns µs; uma borda nesse intervalo é gravada atrasada
-// e um pulso mais curto que a pausa se perde. O CSV traz max_gap_cycles e gaps_over_2us para medir isso.
-// A tarefa ociosa fica fora do Task Watchdog durante a gravação (o laço não a deixa rodar).
+// Unlike /capture (loop with interrupts masked, 2 s max), the polling loop here runs in a priority 1
+// task with interrupts ENABLED: Wi-Fi, HTTP and the watchdog stay alive, and the client can poll
+// progress (/record/status) while recording. The cost: when an interrupt or a higher task takes the
+// CPU, the loop stops for a few us; an edge in that gap is stored late and a pulse shorter than the
+// gap is lost. The CSV reports max_gap_cycles and gaps_over_2us to measure it.
+// The idle task is removed from the Task Watchdog while recording (the loop never lets it run).
 //
-// Tempo: contador de ciclos estendido para 64 bits; cada borda guarda (ciclos >> 4) em 32 bits
-// (66,7 ns, até 286 s). Eventos (rajadas separadas por settle_ms) são contados ao vivo.
-// Buffer cheio: para de guardar bordas, mas continua contando e guarda um resumo por rajada
-// (início, fim, bordas) para não perder os eventos.
-// ADC (opcional, adc_pin): modo contínuo por DMA numa tarefa própria; guarda uma janela analógica por
-// evento (adc_pre_ms antes, adc_post_ms depois), alinhada pelo relógio do sistema (aprox. ±0,2 ms).
+// Time: cycle counter extended to 64 bits; each edge stores (cycles >> 4) in 32 bits (66.7 ns, up to
+// 286 s). Events (bursts separated by settle_ms) are counted live.
+// Buffer full: edges are no longer stored, but counting goes on and a summary per burst
+// (start, end, edges) is kept so no event is lost.
+// ADC (optional, adc_pin): DMA continuous mode in its own task; keeps one analog window per event
+// (adc_pre_ms before, adc_post_ms after), aligned by the system clock (about ±0.2 ms).
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -35,31 +35,31 @@ static const char *TAG = "REC";
 #define CPU_HZ 240000000u
 #define N_CH 8
 #define REC_MAX_S 280
-#define REC_SHIFT 4                 // ciclos >> 4 = 66,7 ns por unidade
+#define REC_SHIFT 4                 // cycles >> 4 = 66.7 ns per unit
 #define REC_MAX_EVENTS 2000
 #define REC_MAX_BURSTS 20000
 #define REC_ADC_MAX_EVENTS 64
 #define REC_ADC_HIST 20000
 
 typedef struct { uint32_t t0, t1, n; uint8_t final; } burst_t;
-typedef struct { uint32_t ev; uint32_t start; uint32_t n; } adc_ev_t;  // índice do evento, 1a amostra, quantas
+typedef struct { uint32_t ev; uint32_t start; uint32_t n; } adc_ev_t;  // event index, first sample, count
 
 typedef struct {
-    volatile int state;       // 0 livre, 1 gravando, 2 pronto (dados esperando /record/data)
+    volatile int state;       // 0 idle, 1 recording, 2 done (data waiting for /record/data)
     volatile bool stop;
     uint32_t s, settle_ticks;
     uint8_t mask, initial, final;
     char pins[64], pull[8];
     uint32_t *t; uint8_t *v; uint32_t n, max;
-    volatile uint32_t total;  // bordas vistas (inclusive depois de cheio)
-    uint32_t *ev_t;            // PSRAM (a RAM interna é pouca)
+    volatile uint32_t total;  // edges seen (including after the buffer filled)
+    uint32_t *ev_t;            // PSRAM (internal RAM is short)
     volatile uint32_t n_ev;
     burst_t *bursts; uint32_t n_bursts;
     uint32_t max_gap, gaps_over, gaps_10us, gaps_100us, gaps_1ms;
     uint64_t max_gap_at;
     uint64_t loops;
-    volatile uint64_t now_cyc;  // ciclos desde o início (lido pela tarefa do ADC)
-    int64_t t0_us;            // esp_timer no início
+    volatile uint64_t now_cyc;  // cycles since start (read by the ADC task)
+    int64_t t0_us;            // esp_timer at start
     int64_t start_wall_us;
     volatile int64_t elapsed_us;
     // ADC
@@ -68,8 +68,8 @@ typedef struct {
     int adc_rate;
     uint32_t adc_period_cycles;
     uint32_t pre_ms, post_ms;
-    uint16_t *hist; uint32_t *hist_t;  // histórico circular: amostra e tempo (ciclos >> 4)
-    uint32_t hist_n;                   // amostras já escritas (posição = hist_n % REC_ADC_HIST)
+    uint16_t *hist; uint32_t *hist_t;  // circular history: sample and time (cycles >> 4)
+    uint32_t hist_n;                   // samples written so far (position = hist_n % REC_ADC_HIST)
     uint16_t *aev; uint32_t *aev_t; uint32_t aev_n, aev_max;
     adc_ev_t *adc_ev; uint32_t n_adc_ev;  // PSRAM
     uint32_t adc_invalid, adc_lost_events;
@@ -98,7 +98,7 @@ static void IRAM_ATTR __attribute__((noinline)) rec_loop(uint64_t end_cyc) {
         uint32_t d = now - prev;
         prev = now;
         cyc += d;
-        if (d > 480) {  // > 2 µs sem olhar o pino
+        if (d > 480) {  // > 2 us without looking at the pin
             gaps_over++;
             if (d > 2400) { g10++; if (d > 24000) { g100++; if (d > 240000) g1ms++; } }
             if (d > max_gap) { max_gap = d; max_at = cyc; }
@@ -132,23 +132,23 @@ static void IRAM_ATTR __attribute__((noinline)) rec_loop(uint64_t end_cyc) {
     rec.final = (uint8_t)last;
 }
 
-// Tarefa do ADC: lê o anel do DMA, mantém um histórico com tempo e recorta uma janela por evento
+// ADC task: reads the DMA ring, keeps a timestamped history and cuts one window per event.
 static void rec_adc_task(void *pv) {
-    uint16_t *buf = heap_caps_malloc(512 * 2, MALLOC_CAP_SPIRAM);  // RAM interna é pouca
-    // liga e desliga o DMA nesta mesma tarefa: adc_digi_start/stop pegam e soltam um mutex do ADC1, que
-    // só pode ser solto pela tarefa que pegou (senão assert em xQueueGenericSend -> panic, visto no 0.4.1)
-    while (!rec.t0_us) vTaskDelay(1);  // espera o laço digital marcar o t0
+    uint16_t *buf = heap_caps_malloc(512 * 2, MALLOC_CAP_SPIRAM);  // internal RAM is short
+    // start and stop DMA in this same task: adc_digi_start/stop take and give an ADC1 mutex that only
+    // the owner task may give (otherwise an assert in xQueueGenericSend -> panic, seen in 0.4.1).
+    while (!rec.t0_us) vTaskDelay(1);  // wait for the digital loop to set t0
     uint32_t t0;
     adc_bg_restart(&t0);
     uint32_t done_ev = 0;
-    const uint32_t per_ticks16 = rec.adc_period_cycles;  // em ciclos
+    const uint32_t per_ticks16 = rec.adc_period_cycles;  // in cycles
     while (1) {
         bool running = rec.state == 1;
         uint32_t inv = 0;
         uint32_t m = adc_bg_read(buf, 512, 20, &inv);
         rec.adc_invalid += inv;
         if (m) {
-            // a última amostra do bloco acabou de sair: tempo = agora; as anteriores, um período cada
+            // the block's last sample just came out: time = now; earlier ones one period apart
             uint64_t now_cyc = (uint64_t)(esp_timer_get_time() - rec.t0_us) * (CPU_HZ / 1000000);
             for (uint32_t i = 0; i < m; i++) {
                 uint32_t pos = rec.hist_n % REC_ADC_HIST;
@@ -158,13 +158,13 @@ static void rec_adc_task(void *pv) {
                 rec.hist_n++;
             }
         }
-        // recorta as janelas dos eventos cujo "depois" já passou
+        // cut the windows of events whose "after" part is over
         uint32_t now_tk = (uint32_t)(((uint64_t)(esp_timer_get_time() - rec.t0_us) * (CPU_HZ / 1000000)) >> REC_SHIFT);
         uint32_t pre_tk = (uint32_t)((uint64_t)rec.pre_ms * (CPU_HZ / 1000) >> REC_SHIFT);
         uint32_t post_tk = (uint32_t)((uint64_t)rec.post_ms * (CPU_HZ / 1000) >> REC_SHIFT);
         while (done_ev < rec.n_ev && (now_tk > rec.ev_t[done_ev] + post_tk + 100000 || !running)) {
             uint32_t te = rec.ev_t[done_ev];
-            // pula eventos que caem dentro da janela do anterior (já cobertos)
+            // skip events inside the previous window (already covered)
             if (rec.n_adc_ev && te <= rec.ev_t[rec.adc_ev[rec.n_adc_ev - 1].ev] + post_tk) { done_ev++; continue; }
             if (rec.n_adc_ev >= REC_ADC_MAX_EVENTS) { rec.adc_lost_events++; done_ev++; continue; }
             uint32_t lo = te > pre_tk ? te - pre_tk : 0, hi = te + post_tk;
@@ -189,17 +189,17 @@ static void rec_adc_task(void *pv) {
 
 static void rec_task(void *pv) {
     TaskHandle_t idle = xTaskGetIdleTaskHandleForCPU(0);
-    esp_task_wdt_delete(idle);  // o laço não deixa a ociosa rodar; volta no fim
+    esp_task_wdt_delete(idle);  // the loop starves the idle task; added back at the end
     uint64_t end_cyc = (uint64_t)rec.s * CPU_HZ;
     rec.t0_us = esp_timer_get_time();
     rec_loop(end_cyc);
     rec.elapsed_us = esp_timer_get_time() - rec.t0_us;
     esp_task_wdt_add(idle);
-    rec.state = 2;  // o ADC termina de recortar as janelas pendentes e sai; só então fecha o driver
+    rec.state = 2;  // the ADC task finishes pending windows and exits; only then is the driver closed
     if (rec.adc) {
         while (!rec.adc_done) vTaskDelay(pdMS_TO_TICKS(10));
     }
-    ESP_LOGI(TAG, "gravação: %lu bordas (%lu guardadas), %lu eventos, gap max %lu ciclos, %lu pausas > 2 µs",
+    ESP_LOGI(TAG, "recording: %lu edges (%lu stored), %lu events, max gap %lu cycles, %lu gaps > 2 us",
              (unsigned long)rec.total, (unsigned long)rec.n, (unsigned long)rec.n_ev, (unsigned long)rec.max_gap,
              (unsigned long)rec.gaps_over);
     xSemaphoreGive(rec_done_sem);
@@ -214,13 +214,13 @@ static void rec_free(void) {
     rec.t = NULL; rec.v = NULL; rec.bursts = NULL; rec.hist = NULL; rec.hist_t = NULL; rec.aev = NULL; rec.aev_t = NULL;
 }
 
-// Descarta uma gravação pronta que ninguém baixou (para /capture e /adc não ficarem travados)
+// Drops a finished recording nobody downloaded (so /capture and /adc are not locked out).
 bool record_discard_if_done(void) {
     if (rec.state != 2) return false;
     rec_free();
     rec.state = 0;
     capture_unlock();
-    ESP_LOGW(TAG, "gravação não baixada descartada");
+    ESP_LOGW(TAG, "undownloaded recording dropped");
     return true;
 }
 
@@ -235,7 +235,7 @@ static void reply_json(httpd_req_t *req, const char *s) {
 static esp_err_t record_start_handler(httpd_req_t *req) {
     char q[240] = "", tmp[32];
     httpd_req_get_url_query_str(req, q, sizeof(q));
-    if (rec.state == 1) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ja gravando"); return ESP_OK; }
+    if (rec.state == 1) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "already recording"); return ESP_OK; }
     record_discard_if_done();
     int s = 60, settle_ms = 5, adc_rate = 10000, pre = 20, post = 80;
     char pins[64] = "IO10", pull[8] = "none", adc_pin[12] = "";
@@ -247,7 +247,7 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
     qp(q, "pins", pins, sizeof(pins));
     qp(q, "pull", pull, sizeof(pull));
     qp(q, "adc_pin", adc_pin, sizeof(adc_pin));
-    if (s < 1 || s > REC_MAX_S) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "s fora de 1..280"); return ESP_OK; }
+    if (s < 1 || s > REC_MAX_S) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "s outside 1..280"); return ESP_OK; }
     settle_ms = MAX(1, MIN(settle_ms, 1000));
     pre = MAX(0, MIN(pre, 500)); post = MAX(1, MIN(post, 500));
     uint8_t mask = 0;
@@ -256,12 +256,12 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
     char *save = NULL;
     for (char *p = strtok_r(pcopy, ",", &save); p; p = strtok_r(NULL, ",", &save)) {
         int i = capture_ch_index(p);
-        if (i < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins: canal invalido"); return ESP_OK; }
+        if (i < 0) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins: invalid channel"); return ESP_OK; }
         mask |= 1 << i;
     }
-    if (!mask) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins vazio"); return ESP_OK; }
-    if (capture_is_busy()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "ocupado (OTA)"); return ESP_OK; }
-    if (!capture_lock(0)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "outra captura em andamento"); return ESP_OK; }
+    if (!mask) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "pins empty"); return ESP_OK; }
+    if (capture_is_busy()) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "busy (OTA)"); return ESP_OK; }
+    if (!capture_lock(0)) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "another capture in progress"); return ESP_OK; }
 
     memset(&rec, 0, sizeof(rec));
     if (!rec_done_sem) rec_done_sem = xSemaphoreCreateBinary();
@@ -270,10 +270,10 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
     rec.settle_ticks = (uint32_t)((uint64_t)settle_ms * (CPU_HZ / 1000) >> REC_SHIFT);
     strlcpy(rec.pins, pins, sizeof(rec.pins));
     strlcpy(rec.pull, pull, sizeof(rec.pull));
-    // Buffers na PSRAM: bordas (5 bytes cada) com o maior bloco livre menos folga para o ADC
+    // Buffers in PSRAM: edges (5 bytes each) in the largest free block minus room for the ADC
     size_t pl = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     size_t reserve = 300 * 1024 + (adc_pin[0] ? 500 * 1024 : 0);
-    uint32_t max = pl > reserve + 64 * 1024 ? (uint32_t)((pl - reserve) / 4) : 0;  // t (4 bytes) num bloco
+    uint32_t max = pl > reserve + 64 * 1024 ? (uint32_t)((pl - reserve) / 4) : 0;  // t (4 bytes) in one block
     max = MIN(max, 250000u);
     rec.t = heap_caps_malloc((size_t)max * 4, MALLOC_CAP_SPIRAM);
     rec.v = heap_caps_malloc(max, MALLOC_CAP_SPIRAM);
@@ -281,7 +281,7 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
     rec.ev_t = heap_caps_malloc(REC_MAX_EVENTS * 4, MALLOC_CAP_SPIRAM);
     if (max < 1000 || !rec.t || !rec.v || !rec.bursts || !rec.ev_t) {
         rec_free(); capture_unlock();
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK;
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_OK;
     }
     rec.max = max;
     if (adc_pin[0]) {
@@ -294,7 +294,7 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
             rec.aev = heap_caps_malloc(rec.aev_max * 2, MALLOC_CAP_SPIRAM);
             rec.aev_t = heap_caps_malloc(rec.aev_max * 4, MALLOC_CAP_SPIRAM);
             rec.adc_ev = heap_caps_malloc(REC_ADC_MAX_EVENTS * sizeof(adc_ev_t), MALLOC_CAP_SPIRAM);
-            if (!rec.hist || !rec.hist_t || !rec.aev || !rec.aev_t || !rec.adc_ev) aerr = "adc: sem memoria";
+            if (!rec.hist || !rec.hist_t || !rec.aev || !rec.aev_t || !rec.adc_ev) aerr = "adc: out of memory";
         }
         if (aerr) {
             adc_bg_close(); rec_free(); capture_unlock();
@@ -319,7 +319,7 @@ static esp_err_t record_start_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// GET /record/status: progresso (ao vivo) e os tempos dos últimos eventos
+// GET /record/status: live progress and the times of the latest events
 static esp_err_t record_status_handler(httpd_req_t *req) {
     char buf[700];
     double el = rec.state == 1 ? (esp_timer_get_time() - rec.t0_us) / 1e6 : rec.elapsed_us / 1e6;
@@ -339,7 +339,7 @@ static esp_err_t record_status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// POST /record/stop: encerra agora (os dados continuam disponíveis em /record/data); ?discard=1 apaga
+// POST /record/stop: stops now (data stays available on /record/data); ?discard=1 drops it
 static esp_err_t record_stop_handler(httpd_req_t *req) {
     char q[40] = "", tmp[8] = "";
     httpd_req_get_url_query_str(req, q, sizeof(q));
@@ -354,13 +354,13 @@ static esp_err_t record_stop_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-// GET /record/data: espera o fim e manda o CSV gpio_edges v1 (ciclos de 240 MHz, 64 bits), com resumo das
-// rajadas depois do buffer cheio e, se houver ADC, as janelas analógicas por evento (cycles,raw,mv).
+// GET /record/data: waits for the end and sends the gpio_edges v1 CSV (240 MHz cycles, 64 bits), with the
+// burst summary after the buffer filled and, with the ADC on, the analog window per event (cycles,raw,mv).
 static esp_err_t record_data_handler(httpd_req_t *req) {
-    if (rec.state == 0) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "nenhuma gravacao"); return ESP_OK; }
+    if (rec.state == 0) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no recording"); return ESP_OK; }
     while (rec.state == 1) {
         if (xSemaphoreTake(rec_done_sem, pdMS_TO_TICKS(500)) == pdTRUE) { xSemaphoreGive(rec_done_sem); break; }
-        if (client_gone(req)) return ESP_OK;  // os dados ficam para a próxima chamada
+        if (client_gone(req)) return ESP_OK;  // the data stays for the next call
     }
     while (rec.task) vTaskDelay(pdMS_TO_TICKS(10));
     httpd_resp_set_type(req, "text/csv");
@@ -372,8 +372,8 @@ static esp_err_t record_data_handler(httpd_req_t *req) {
         if (rec.mask & (1 << i)) len += snprintf(line + len, sizeof(line) - len, " %s=%d", capture_ch_name(i), (rec.initial >> i) & 1);
     len += snprintf(line + len, sizeof(line) - len, "\ncycles,pin,level\n");
     httpd_resp_send_chunk(req, line, len);
-    char *out = heap_caps_malloc(1460, MALLOC_CAP_SPIRAM);  // RAM interna é pouca
-    if (!out) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "sem memoria"); return ESP_OK; }
+    char *out = heap_caps_malloc(1460, MALLOC_CAP_SPIRAM);  // internal RAM is short
+    if (!out) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "out of memory"); return ESP_OK; }
     const int OUTSZ = 1460;
     int olen = 0;
     uint8_t prev = rec.initial;

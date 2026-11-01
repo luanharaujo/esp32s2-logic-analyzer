@@ -1,7 +1,7 @@
-// Analisador lógico pela rede na Wi-Fi Devboard (clone preto, ESP32-S2) usada sozinha.
-// Fase 1 (este arquivo): base de rede estável com OTA. Wi-Fi com gerente de BSSID (herdado
-// do teclado USB), mDNS, HTTP (/status, /log, /scan, /ota, /reboot), LED RGB, Task Watchdog,
-// log em RAM RTC e rollback de OTA. A captura de bordas entra depois, sempre por OTA.
+// Network logic analyzer on the Wi-Fi Devboard for Flipper Zero (black clone, ESP32-S2), used
+// on its own. This file is the network base: Wi-Fi with a BSSID manager, mDNS, HTTP (/status,
+// /log, /scan, /ota, /reboot), RGB LED, Task Watchdog, a log ring in RTC RAM and OTA rollback.
+// Capture lives in capture.c, adc_cap.c and record.c.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,7 +35,7 @@
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
 #else
-#warning "main/wifi_secrets.h ausente: Wi-Fi desligado (copie wifi_secrets.example.h)"
+#warning "main/wifi_secrets.h missing: Wi-Fi disabled (copy wifi_secrets.example.h)"
 #define WIFI_SSID ""
 #define WIFI_PASS ""
 #define LA_TOKEN  ""
@@ -47,15 +47,15 @@
 #define HOSTNAME "logic-s2"
 static const char *TAG = "S2LA";
 
-// LED RGB da devboard: R=IO6, G=IO5, B=IO4, ânodo comum (aceso em nível baixo), como na
-// devboard oficial. Confirmar no clone; se as cores saírem trocadas, ajustar aqui.
+// Devboard RGB LED: R=IO6, G=IO5, B=IO4, common anode (on when low), as on the official
+// devboard. Not confirmed on the clone yet; if the colors come out swapped, fix them here.
 #define LED_R_GPIO 6
 #define LED_G_GPIO 5
 #define LED_B_GPIO 4
 #define LED_ACTIVE_LOW 1
 
 // ---------------------------------------------------------------------------------------
-// Diagnóstico persistente (RTC slow memory, sobrevive a reset por software/panic/watchdog)
+// Persistent diagnostics (RTC slow memory, survives software reset, panic and watchdog)
 // ---------------------------------------------------------------------------------------
 #define LOG_RING_SIZE 3072
 #define RTC_DIAG_MAGIC 0x53324C41u  // "S2LA"
@@ -121,8 +121,8 @@ static void rtc_diag_boot(void) {
     rtc_diag.boot_count = boots;
 }
 
-// Motivo do último panic/abort (RTC, sobrevive ao reset). Preenchido pelos wrappers do linker
-// (-Wl,--wrap=esp_panic_handler,--wrap=esp_system_abort); lido e zerado no boot.
+// Reason for the last panic/abort (RTC, survives the reset). Filled by the linker wrappers
+// (-Wl,--wrap=esp_panic_handler,--wrap=esp_system_abort); read and cleared at boot.
 #define PANIC_MAGIC 0x50414E43u
 typedef struct { uint32_t magic; char text[120]; } panic_note_t;
 static RTC_NOINIT_ATTR panic_note_t panic_note;
@@ -137,7 +137,7 @@ IRAM_ATTR void __wrap_esp_system_abort(const char *details) {
     __real_esp_system_abort(details);
 }
 IRAM_ATTR void __wrap_esp_panic_handler(panic_info_t *info) {
-    // abort já anotou os detalhes; só acrescenta se não houver nada
+    // abort already wrote the details; only fill in when empty.
     if (panic_note.magic != PANIC_MAGIC) {
         const uint32_t *fr = (const uint32_t *)info->frame;  // XtExcFrame: exit, pc, ps, sar, vpri, a0..
         panic_note.magic = PANIC_MAGIC;
@@ -156,12 +156,12 @@ static void panic_note_boot(void) {
     panic_note.magic = 0;
 }
 
-// Marca de progresso que sobrevive a panic (aparece em reset_detail no boot seguinte)
+// Progress mark that survives a panic (shows up as reset_detail on the next boot).
 void diag_mark(const char *what) { strlcpy(rtc_diag.detail, what, sizeof(rtc_diag.detail)); }
 
 static void restart_with(const char *detail) {
     strlcpy(rtc_diag.detail, detail, sizeof(rtc_diag.detail));
-    ESP_LOGW(TAG, "Reiniciando: %s", detail);
+    ESP_LOGW(TAG, "Restarting: %s", detail);
     vTaskDelay(pdMS_TO_TICKS(300));
     esp_restart();
 }
@@ -178,8 +178,8 @@ static void led_rgb(bool r, bool g, bool b) {
     gpio_set_level(LED_B_GPIO, LED_ACTIVE_LOW ? !b : b);
 }
 
-// vermelho piscando = sem Wi-Fi; azul piscando = conectando; verde breve a cada 2 s = ok;
-// magenta fixo = OTA em andamento; vermelho fixo = erro
+// Blinking red = no Wi-Fi; blinking blue = connecting; short green every 2 s = ok;
+// steady magenta = OTA in progress; steady red = error.
 static void led_task(void *pv) {
     uint32_t t = 0;
     while (1) {
@@ -206,12 +206,12 @@ static void led_init(void) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Wi-Fi: gerente de BSSID (do teclado USB, 22/10/2026). Há dois APs "MINHA-REDE": o AP mesh (rede do
-// Mac) e o modem a montante (outra sub-rede, inalcançável). Depois de um reset o AP mesh às
-// vezes recusa a 1a autenticação e o driver, sozinho, cai no modem e fica lá. Aqui: varre,
-// ordena por RSSI, põe por último os BSSIDs da lista de evitar (WIFI_AVOID_BSSID_PREFIXES,
-// em wifi_secrets.h), insiste 4 vezes em cada um e, se acabou num AP evitado ou mais fraco,
-// revê a cada 1 min (evitado) ou 5 min e troca quando o melhor aparecer.
+// Wi-Fi: BSSID manager. If two APs share the SSID (a mesh AP and the upstream modem on another,
+// unreachable subnet), after a reset the mesh AP sometimes rejects the first authentication and
+// the driver falls back to the modem and stays there. So: scan, sort by RSSI, move the BSSIDs in
+// the avoid list (WIFI_AVOID_BSSID_PREFIXES in wifi_secrets.h) to the end, try each one 4 times
+// and, if it ended up on an avoided or weaker AP, scan again every 1 min (avoided) or 5 min and
+// switch when the better one shows up.
 // ---------------------------------------------------------------------------------------
 static EventGroupHandle_t wifi_events;
 #define WIFI_GOT_IP_BIT  BIT0
@@ -253,9 +253,9 @@ static int wifi_scan_candidates(cand_t *out) {
     uint16_t n = 16;
     wifi_ap_record_t *aps = calloc(n, sizeof(*aps));
     if (!aps) return 0;
-    esp_wifi_scan_get_ap_records(&n, aps);  // já ordenados por RSSI
+    esp_wifi_scan_get_ap_records(&n, aps);  // already sorted by RSSI
     int c = 0;
-    for (int pass = 0; pass < 2; pass++) {  // primeiro os bons, depois os evitados
+    for (int pass = 0; pass < 2; pass++) {  // preferred APs first, avoided ones last
         for (int i = 0; i < n && c < WIFI_MAX_CAND; i++) {
             if (strcmp((const char *)aps[i].ssid, WIFI_SSID) != 0) continue;
             bool avoid = bssid_avoided(aps[i].bssid);
@@ -264,8 +264,8 @@ static int wifi_scan_candidates(cand_t *out) {
             out[c].rssi = aps[i].rssi;
             out[c].ch = aps[i].primary;
             out[c].avoid = avoid;
-            ESP_LOGI(TAG, "Wi-Fi candidato %d: " MACSTR " canal %d rssi %d%s", c, MAC2STR(aps[i].bssid),
-                     aps[i].primary, aps[i].rssi, avoid ? " (evitado)" : "");
+            ESP_LOGI(TAG, "Wi-Fi candidate %d: " MACSTR " channel %d rssi %d%s", c, MAC2STR(aps[i].bssid),
+                     aps[i].primary, aps[i].rssi, avoid ? " (avoided)" : "");
             c++;
         }
     }
@@ -278,7 +278,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
         wifi_last_reason = d->reason;
         if (wifi_has_ip) { wifi_disconnects++; wifi_lost_since_us = esp_timer_get_time(); }
-        ESP_LOGW(TAG, "Wi-Fi desconectado de " MACSTR " (motivo %d)", MAC2STR(d->bssid), d->reason);
+        ESP_LOGW(TAG, "Wi-Fi disconnected from " MACSTR " (reason %d)", MAC2STR(d->bssid), d->reason);
         wifi_has_ip = false;
         if (led_state != LED_OTA) led_state = LED_CONNECTING;
         xEventGroupSetBits(wifi_events, WIFI_DISCONN_BIT);
@@ -301,7 +301,7 @@ static void wifi_manager_task(void *pv) {
         led_state = LED_CONNECTING;
         int n = wifi_scan_candidates(cand);
         if (n == 0) {
-            ESP_LOGW(TAG, "Wi-Fi: nenhum AP com SSID %s; nova varredura em 5 s", WIFI_SSID);
+            ESP_LOGW(TAG, "Wi-Fi: no AP with SSID %s; scanning again in 5 s", WIFI_SSID);
             led_state = LED_NO_WIFI;
             vTaskDelay(pdMS_TO_TICKS(5000));
             continue;
@@ -316,7 +316,7 @@ static void wifi_manager_task(void *pv) {
             esp_wifi_set_config(WIFI_IF_STA, &cfg);
             bool got = false;
             for (int t = 0; t < WIFI_TRIES_PER_AP && !got; t++) {
-                ESP_LOGI(TAG, "Wi-Fi: conectando em " MACSTR " (tentativa %d)", MAC2STR(cand[c].bssid), t + 1);
+                ESP_LOGI(TAG, "Wi-Fi: connecting to " MACSTR " (attempt %d)", MAC2STR(cand[c].bssid), t + 1);
                 xEventGroupClearBits(wifi_events, WIFI_GOT_IP_BIT | WIFI_DISCONN_BIT);
                 esp_wifi_connect();
                 EventBits_t b = xEventGroupWaitBits(wifi_events, WIFI_GOT_IP_BIT | WIFI_DISCONN_BIT, pdFALSE,
@@ -337,18 +337,18 @@ static void wifi_manager_task(void *pv) {
                 cand_t nb[WIFI_MAX_CAND];
                 int m = wifi_scan_candidates(nb);
                 if (m > 0 && memcmp(nb[0].bssid, cand[c].bssid, 6) != 0 && (cand[c].avoid || !nb[0].avoid)) {
-                    ESP_LOGW(TAG, "Wi-Fi: AP preferido disponível, trocando");
+                    ESP_LOGW(TAG, "Wi-Fi: preferred AP available, switching");
                     esp_wifi_disconnect();
                     break;
                 }
             }
-            break;  // caiu: varre de novo
+            break;  // dropped: scan again
         }
     }
 }
 
 // ---------------------------------------------------------------------------------------
-// OTA (POST /ota com o .bin no corpo, ou POST /ota?url=... para o ESP baixar) + rollback
+// OTA (POST /ota with the .bin as the body, or POST /ota?url=... for the ESP to fetch) + rollback
 // ---------------------------------------------------------------------------------------
 static volatile bool ota_busy = false;
 static char ota_last[96] = "";
@@ -362,28 +362,28 @@ static void restart_task(void *pv) {
 static void ota_url_task(void *pv) {
     char *url = (char *)pv;
     esp_http_client_config_t http = { .url = url, .timeout_ms = 15000, .keep_alive_enable = true };
-    ESP_LOGI(TAG, "OTA: baixando %s", url);
-    esp_err_t err = esp_https_ota(&http);  // IDF 4.4: recebe a config do http_client
+    ESP_LOGI(TAG, "OTA: downloading %s", url);
+    esp_err_t err = esp_https_ota(&http);  // IDF 4.4 takes the http_client config
     free(url);
     if (err == ESP_OK) {
         strlcpy(ota_last, "ok (url)", sizeof(ota_last));
         restart_with("ota_url");
     }
-    snprintf(ota_last, sizeof(ota_last), "erro url: %s", esp_err_to_name(err));
+    snprintf(ota_last, sizeof(ota_last), "url error: %s", esp_err_to_name(err));
     ESP_LOGE(TAG, "OTA: %s", ota_last);
     ota_busy = false;
     led_state = wifi_has_ip ? LED_OK : LED_CONNECTING;
     vTaskDelete(NULL);
 }
 
-// O novo firmware fica "pendente" até provar que sobe a rede. Se não conseguir IP + HTTP em
-// 3 min, o supervisor manda voltar para o anterior.
+// A new image stays "pending" until it proves it can bring the network up. If it gets no
+// IP + HTTP within 3 min, the supervisor rolls back to the previous one.
 static void ota_rollback_check_boot(void) {
     const esp_partition_t *run = esp_ota_get_running_partition();
     esp_ota_img_states_t st;
     if (esp_ota_get_state_partition(run, &st) == ESP_OK && st == ESP_OTA_IMG_PENDING_VERIFY) {
         ota_pending_verify = true;
-        ESP_LOGW(TAG, "Firmware novo pendente de validação (rollback em 180 s se a rede não subir)");
+        ESP_LOGW(TAG, "New firmware pending validation (rollback in 180 s if the network does not come up)");
     }
 }
 
@@ -444,21 +444,21 @@ static esp_err_t status_handler(httpd_req_t *req) {
 static esp_err_t root_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_sendstr(req,
-        "logic-s2: analisador logico (ESP32-S2)\n"
-        "GET  /status          estado em JSON\n"
-        "GET  /log[?prev=1]    log em RAM (do boot atual ou do anterior)\n"
-        "GET  /scan            APs visiveis\n"
-        "POST /ota             corpo = firmware .bin (header X-Token, opcional X-SHA256)\n"
-        "POST /ota?url=URL     o ESP baixa o .bin (header X-Token)\n"
-        "POST /reboot          (header X-Token)\n"
-        "GET  /channels        mapa dos 8 canais\n"
-        "GET  /levels[?pull=]  nivel atual dos canais\n"
+        "logic-s2: logic analyzer (ESP32-S2)\n"
+        "GET  /status          state as JSON\n"
+        "GET  /log[?prev=1]    RAM log (current or previous boot)\n"
+        "GET  /scan            visible APs\n"
+        "POST /ota             body = firmware .bin (X-Token header, optional X-SHA256)\n"
+        "POST /ota?url=URL     the ESP downloads the .bin (X-Token header)\n"
+        "POST /reboot          (X-Token header)\n"
+        "GET  /channels        map of the 8 channels\n"
+        "GET  /levels[?pull=]  current channel levels\n"
         "GET  /capture?ms=100&trigger=IO10&edge=fall&timeout_ms=10000&pull=up&pins=IO10,IO11\n"
-        "                      CSV de bordas (formato gpio_edges v1, ciclos de 240 MHz)\n"
-        "POST /gen?pin=IO10&hz=1000&duty=50   gerador de teste no canal (hz=0 desliga; X-Token)\n"
+        "                      edge CSV (gpio_edges v1 format, 240 MHz cycles)\n"
+        "POST /gen?pin=IO10&hz=1000&duty=50   test generator on a channel (hz=0 stops it; X-Token)\n"
         "GET  /adc?pin=IO10&ms=100&rate=83333&atten=11[&trig_mv=1650&edge=fall&pre=100]\n"
-        "                      CSV analogico (us,raw,mv; ADC1: IO10, IO1, IO2)\n"
-        "POST /record?s=120&pins=IO10[&adc_pin=IO1&adc_rate=10000]  gravacao continua (ate 280 s)\n"
+        "                      analog CSV (us,raw,mv; ADC1: IO10, IO1, IO2)\n"
+        "POST /record?s=120&pins=IO10[&adc_pin=IO1&adc_rate=10000]  continuous recording (up to 280 s)\n"
         "GET  /record/status | GET /record/data | POST /record/stop[?discard=1]\n");
     return ESP_OK;
 }
@@ -471,9 +471,9 @@ static esp_err_t log_handler(httpd_req_t *req) {
     size_t pos;
     bool wrapped;
     if (want_prev) {
-        if (!prev_diag_valid) { httpd_resp_sendstr(req, "sem log do boot anterior (poweron)\n"); return ESP_OK; }
+        if (!prev_diag_valid) { httpd_resp_sendstr(req, "no log from the previous boot (poweron)\n"); return ESP_OK; }
         char hdr[128];
-        snprintf(hdr, sizeof(hdr), "# boot %lu, viveu %lu s, motivo: '%s'\n", (unsigned long)prev_diag.boot_count,
+        snprintf(hdr, sizeof(hdr), "# boot %lu, ran %lu s, reason: '%s'\n", (unsigned long)prev_diag.boot_count,
                  (unsigned long)prev_diag.last_uptime_s, prev_diag.detail);
         httpd_resp_send_chunk(req, hdr, strlen(hdr));
         memcpy(snap, prev_diag.log, LOG_RING_SIZE);
@@ -539,7 +539,7 @@ static void url_decode(char *s) {
 
 static esp_err_t ota_handler(httpd_req_t *req) {
     if (!token_ok(req)) return ESP_OK;
-    if (ota_busy) { json_reply(req, "{\"ok\":false,\"err\":\"ota em andamento\"}\n"); return ESP_OK; }
+    if (ota_busy) { json_reply(req, "{\"ok\":false,\"err\":\"ota in progress\"}\n"); return ESP_OK; }
 
     char q[300];
     if (httpd_req_get_url_query_str(req, q, sizeof(q)) == ESP_OK) {
@@ -548,7 +548,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
             url_decode(url);
             ota_busy = true;
             led_state = LED_OTA;
-            json_reply(req, "{\"ok\":true,\"mode\":\"url\",\"note\":\"baixando; o ESP reinicia sozinho\"}\n");
+            json_reply(req, "{\"ok\":true,\"mode\":\"url\",\"note\":\"downloading; the ESP restarts on its own\"}\n");
             xTaskCreate(ota_url_task, "ota_url", 8192, url, 5, NULL);
             return ESP_OK;
         }
@@ -558,7 +558,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     int total = req->content_len;
     const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
     if (total <= 0 || !part || total > (int)part->size) {
-        snprintf(ota_last, sizeof(ota_last), "tamanho invalido (%d)", total);
+        snprintf(ota_last, sizeof(ota_last), "invalid size (%d)", total);
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, ota_last);
         return ESP_OK;
     }
@@ -568,7 +568,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
 
     ota_busy = true;
     led_state = LED_OTA;
-    ESP_LOGI(TAG, "OTA: recebendo %d bytes para %s", total, part->label);
+    ESP_LOGI(TAG, "OTA: receiving %d bytes into %s", total, part->label);
     esp_ota_handle_t h = 0;
     esp_err_t err = esp_ota_begin(part, total, &h);
     if (err != ESP_OK) goto fail;
@@ -596,19 +596,19 @@ static esp_err_t ota_handler(httpd_req_t *req) {
         for (char *p = sha_hex; *p; p++) if (*p >= 'A' && *p <= 'F') *p += 32;
         if (strcmp(hex, sha_hex) != 0) {
             esp_ota_abort(h);
-            strlcpy(ota_last, "sha256 diferente", sizeof(ota_last));
+            strlcpy(ota_last, "sha256 mismatch", sizeof(ota_last));
             ota_busy = false;
             led_state = LED_OK;
             httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, ota_last);
             return ESP_OK;
         }
     }
-    err = esp_ota_end(h);  // valida a imagem (cabeçalho, checksum)
+    err = esp_ota_end(h);  // validates the image (header, checksum)
     if (err != ESP_OK) goto fail;
     err = esp_ota_set_boot_partition(part);
     if (err != ESP_OK) goto fail;
     snprintf(ota_last, sizeof(ota_last), "ok %d bytes -> %s", total, part->label);
-    ESP_LOGI(TAG, "OTA: %s; reiniciando", ota_last);
+    ESP_LOGI(TAG, "OTA: %s; restarting", ota_last);
     char reply[160];
     snprintf(reply, sizeof(reply), "{\"ok\":true,\"bytes\":%d,\"partition\":\"%s\",\"reboot\":true}\n", total, part->label);
     json_reply(req, reply);
@@ -616,7 +616,7 @@ static esp_err_t ota_handler(httpd_req_t *req) {
     return ESP_OK;
 
 fail:
-    snprintf(ota_last, sizeof(ota_last), "erro: %s (recebido parcial)", esp_err_to_name(err));
+    snprintf(ota_last, sizeof(ota_last), "error: %s (partial upload)", esp_err_to_name(err));
     ESP_LOGE(TAG, "OTA: %s", ota_last);
     ota_busy = false;
     led_state = wifi_has_ip ? LED_OK : LED_CONNECTING;
@@ -634,7 +634,7 @@ static void start_http(void) {
     cfg.lru_purge_enable = true;
     cfg.recv_wait_timeout = 10;
     if (httpd_start(&server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP não subiu");
+        ESP_LOGE(TAG, "HTTP server did not start");
         return;
     }
     const httpd_uri_t uris[] = {
@@ -650,14 +650,14 @@ static void start_http(void) {
     adc_register(server);
     record_register(server);
     http_started = true;
-    ESP_LOGI(TAG, "HTTP em :80");
+    ESP_LOGI(TAG, "HTTP on :80");
 }
 
 static void start_mdns(void) {
     if (mdns_started) return;
-    if (mdns_init() != ESP_OK) { ESP_LOGE(TAG, "mDNS falhou"); return; }
+    if (mdns_init() != ESP_OK) { ESP_LOGE(TAG, "mDNS failed"); return; }
     mdns_hostname_set(HOSTNAME);
-    mdns_instance_name_set("Analisador logico ESP32-S2");
+    mdns_instance_name_set("ESP32-S2 logic analyzer");
     mdns_txt_item_t txt[] = { { "fw", esp_ota_get_app_description()->version }, { "path", "/status" } };
     mdns_service_add(NULL, "_http", "_tcp", 80, txt, 2);
     mdns_started = true;
@@ -665,8 +665,8 @@ static void start_mdns(void) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Supervisor: alimenta o Task Watchdog (panic em 10 s se travar), valida/rola de volta a
-// OTA e reinicia se ficar 15 min sem Wi-Fi depois de já ter conectado (ou 10 min sem nunca conectar).
+// Supervisor: feeds the Task Watchdog (panic after 10 s if stuck), validates or rolls back the
+// OTA image and restarts after 15 min without Wi-Fi once connected (or 10 min if it never connected).
 // ---------------------------------------------------------------------------------------
 #define OTA_VERIFY_DEADLINE_S 180
 #define OTA_VERIFY_STABLE_S   20
@@ -686,10 +686,10 @@ static void supervisor_task(void *pv) {
             if (wifi_has_ip && http_started && ip_since_us && now - ip_since_us > OTA_VERIFY_STABLE_S * 1000000LL) {
                 esp_ota_mark_app_valid_cancel_rollback();
                 ota_pending_verify = false;
-                ESP_LOGI(TAG, "Firmware novo validado (rede ok por %d s)", OTA_VERIFY_STABLE_S);
+                ESP_LOGI(TAG, "New firmware validated (network ok for %d s)", OTA_VERIFY_STABLE_S);
             } else if (now > OTA_VERIFY_DEADLINE_S * 1000000LL) {
                 strlcpy(rtc_diag.detail, "ota_rollback", sizeof(rtc_diag.detail));
-                ESP_LOGE(TAG, "Firmware novo sem rede em %d s: voltando ao anterior", OTA_VERIFY_DEADLINE_S);
+                ESP_LOGE(TAG, "New firmware without network after %d s: rolling back", OTA_VERIFY_DEADLINE_S);
                 vTaskDelay(pdMS_TO_TICKS(200));
                 esp_ota_mark_app_invalid_rollback_and_reboot();
             }
@@ -701,7 +701,7 @@ static void supervisor_task(void *pv) {
             restart_with("wifi_never_10min");
         }
         if ((now / 1000000) % 60 == 0) {
-            ESP_LOGI(TAG, "vivo: uptime %lld s, ip '%s', heap %u", now / 1000000, wifi_ip, (unsigned)esp_get_free_heap_size());
+            ESP_LOGI(TAG, "alive: uptime %lld s, ip '%s', heap %u", now / 1000000, wifi_ip, (unsigned)esp_get_free_heap_size());
         }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -713,10 +713,10 @@ void app_main(void) {
     orig_vprintf = esp_log_set_vprintf(ring_vprintf);
     led_init();
     const esp_app_desc_t *app = esp_ota_get_app_description();
-    ESP_LOGI(TAG, "Boot %s #%lu, reset=%s, detalhe anterior='%s', viveu %lu s", app->version,
+    ESP_LOGI(TAG, "Boot %s #%lu, reset=%s, previous detail='%s', ran %lu s", app->version,
              (unsigned long)rtc_diag.boot_count, reset_reason_str(), prev_diag_valid ? prev_diag.detail : "",
              prev_diag_valid ? (unsigned long)prev_diag.last_uptime_s : 0UL);
-    if (prev_panic[0]) ESP_LOGW(TAG, "panic anterior: %s", prev_panic);
+    if (prev_panic[0]) ESP_LOGW(TAG, "previous panic: %s", prev_panic);
     ota_rollback_check_boot();
     capture_init(is_ota_busy, token_ok);
     xTaskCreate(supervisor_task, "supervisor", 3072, NULL, 10, NULL);
@@ -734,7 +734,7 @@ void app_main(void) {
     wifi_events = xEventGroupCreate();
 
     if (strlen(WIFI_SSID) == 0) {
-        ESP_LOGE(TAG, "Sem wifi_secrets.h: sem rede");
+        ESP_LOGE(TAG, "No wifi_secrets.h: no network");
         led_state = LED_ERROR;
         return;
     }
@@ -745,7 +745,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    esp_wifi_set_ps(WIFI_PS_NONE);  // latência baixa e estável para HTTP; a placa fica na tomada
+    esp_wifi_set_ps(WIFI_PS_NONE);  // low, steady HTTP latency; the board runs from a USB charger
     xTaskCreate(wifi_manager_task, "wifi_mgr", 4096, NULL, 4, NULL);
 
     xEventGroupWaitBits(wifi_events, WIFI_EVER_IP_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
