@@ -1,6 +1,6 @@
 """Backup da flash pelo USB da ROM do ESP32-S2. O read_flash do esptool falha com 'Corrupt data' na
 USB-OTG do S2 (64 pacotes de 4 KB em voo); aqui: pacotes de 1 KB, 1 em voo, blocos de 16 KB conferidos
-por MD5 do stub, com repetição. Uso: python ler_flash.py PORTA SAIDA [TAMANHO]"""
+por MD5 do stub, com repetição. Uso: python read_flash.py PORTA SAIDA [TAMANHO]"""
 import hashlib, struct, sys, time
 import esptool
 from esptool.util import hexify

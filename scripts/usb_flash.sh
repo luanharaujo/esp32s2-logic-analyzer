@@ -10,7 +10,7 @@ ls "$ROOT"/backup/*_flash_*MB.bin >/dev/null 2>&1 || { echo "✗ sem backup em b
 "$ROOT/scripts/build.sh"
 # A ROM USB do S2 às vezes para de responder entre chamadas: destrava com reset de barramento e repete
 esp() { for i in 1 2 3 4; do uv run -q "$ROOT/scripts/usb_reset.py" >/dev/null; esptool "$@" && return 0; echo "… nova tentativa"; done; return 1; }
-PORT="$("$IDF_PYTHON" "$ROOT/scripts/porta_esp.py")"
+PORT="$("$IDF_PYTHON" "$ROOT/scripts/find_port.py")"
 echo "▶ Porta: $PORT"
 cd "$ROOT/firmware/build"
 esp --chip esp32s2 -p "$PORT" --before no_reset --after no_reset erase_flash
