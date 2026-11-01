@@ -53,6 +53,8 @@ uv run agent/analyzer.py capture --ms 100 --trigger IO10 --edge fall --pins IO10
 uv run agent/analyzer.py capture --ms 20 --trigger IO10 --edge fall --adc-pin IO1   # digital + analog, one time base
 uv run agent/analyzer.py record --s 120 --pins IO10 --adc-pin IO1 --show
 uv run agent/analyzer.py live --pin IO1
+uv run agent/analyzer.py adc-log --adc-pin IO1 --out log.csv   # until Ctrl-C, epoch_ms,mv
+uv run agent/analyzer.py adc-plot log.csv
 uv run agent/analyzer.py selftest
 uv run agent/analyzer.py mcp
 ```
