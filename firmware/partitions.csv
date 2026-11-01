@@ -1,4 +1,4 @@
-# ESP32-S2 com 4 MB de flash: dois slots de OTA de 1,875 MB (rollback ligado)
+# ESP32-S2 with 4 MB flash: two 1.875 MB OTA slots (rollback enabled)
 # Name,   Type, SubType, Offset,   Size
 nvs,      data, nvs,     0x9000,   0x4000
 otadata,  data, ota,     0xd000,   0x2000

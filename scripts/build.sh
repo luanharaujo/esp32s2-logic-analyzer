@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Compila o firmware (sem gravar). Saída: firmware/build/s2la.bin
+# Builds the firmware without flashing. Output: firmware/build/s2la.bin
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "$ROOT/scripts/idf_env.sh"

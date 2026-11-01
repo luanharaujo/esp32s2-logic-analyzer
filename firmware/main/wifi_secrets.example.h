@@ -1,6 +1,6 @@
 #pragma once
-// Copiar para wifi_secrets.h (fora do git) e preencher.
-#define WIFI_SSID "nome-da-rede"
-#define WIFI_PASS "senha"
-#define LA_TOKEN  "token-de-32-hex (o mesmo de ~/.config/s2la/token)"
-#define WIFI_AVOID_BSSID_PREFIXES ""  // ex.: "aa:bb:cc,aa:bb:cc:dd:ee:ff"
+// Copy to wifi_secrets.h (ignored by git) and fill in.
+#define WIFI_SSID "network-name"
+#define WIFI_PASS "password"
+#define LA_TOKEN  "32-hex-char token (same as ~/.config/s2la/token)"
+#define WIFI_AVOID_BSSID_PREFIXES ""  // for example "aa:bb:cc,11:22:33:44:55:66"

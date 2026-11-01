@@ -1,6 +1,6 @@
-"""Backup da flash pelo USB da ROM do ESP32-S2. O read_flash do esptool falha com 'Corrupt data' na
-USB-OTG do S2 (64 pacotes de 4 KB em voo); aqui: pacotes de 1 KB, 1 em voo, blocos de 16 KB conferidos
-por MD5 do stub, com repetição. Uso: python read_flash.py PORTA SAIDA [TAMANHO]"""
+"""Flash backup over the ESP32-S2 ROM USB. esptool read_flash fails with 'Corrupt data' on the S2
+USB-OTG (64 packets of 4 KB in flight); here: 1 KB packets, 1 in flight, 16 KB blocks checked
+against the stub's MD5, with retries. Usage: python read_flash.py PORT OUTPUT [SIZE]"""
 import hashlib, struct, sys, time
 import esptool
 from esptool.util import hexify
@@ -18,12 +18,12 @@ def read_block(off, length):
     while len(data) < length:
         p = esp.read()
         if len(p) != PKT:
-            raise RuntimeError(f"pacote de {len(p)} bytes")
+            raise RuntimeError(f"got a {len(p)} byte packet")
         data += p
         esp.write(struct.pack("<I", len(data)))
     dig = esp.read()
     if len(dig) != 16 or hexify(dig).upper() != hashlib.md5(data).hexdigest().upper():
-        raise RuntimeError("md5 diferente")
+        raise RuntimeError("md5 mismatch")
     return data
 
 def drain():
@@ -43,12 +43,12 @@ for off in range(0, size, BLOCK):
             data += read_block(off, BLOCK)
             break
         except Exception as e:
-            print(f"bloco {off:#x} tentativa {tent+1}: {e}", flush=True)
+            print(f"block {off:#x} attempt {tent+1}: {e}", flush=True)
             drain()
     else:
-        open(out + ".parcial", "wb").write(data)
-        sys.exit(f"falhou no bloco {off:#x}")
+        open(out + ".partial", "wb").write(data)
+        sys.exit(f"failed at block {off:#x}")
     if (off // BLOCK) % 16 == 15:
-        print(f"{(off+BLOCK)*100//size}% em {time.time()-t0:.0f} s", flush=True)
+        print(f"{(off+BLOCK)*100//size}% in {time.time()-t0:.0f} s", flush=True)
 open(out, "wb").write(data)
 print("ok sha256", hashlib.sha256(data).hexdigest())
