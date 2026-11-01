@@ -24,6 +24,7 @@ PATTERN = [3, 5, 12, 8, 40, 25, 20000, 4, 6, 15, 10, 60]
 def fake_combined(q: dict, ms: int) -> str:
     """Combined capture: IO10 digital (falls at 0, rises at 300 us, falls for good at 600 us) and the same
     node on the ADC (IO1, 20 kHz) from 1 ms before the trigger, with samples up to 1 period late."""
+    time.sleep(ms / 1000)  # the capture window takes real time, like the firmware
     lines = [f"# gpio_edges v1 mode=s2dedic cpu_hz={HZ} ms={ms} pull=none trigger=IO10 edge=fall tmode=poll pins=IO10",
              "# initial IO10=1", "cycles,pin,level", "0,IO10,0", f"{300 * 240},IO10,1", f"{600 * 240},IO10,0",
              "# end edges=3 overflow=0 max_gap_cycles=22 status=ok loops=1 max_edges=1 buf=psram wait_ms=10 err="]
@@ -39,7 +40,10 @@ def fake_combined(q: dict, ms: int) -> str:
         raw = 4095 if lv else 30
         lines.append(f"{c},{raw},{raw * 2500 // 4095}")
         c += per; n += 1
-    lines.append(f"# adc_end samples={n} wanted={n} chain=3070 invalid=0 period_cycles={per} first_cycles={-1000 * 240 + 77} slice_ms=50")
+    wanted = n
+    if n > 3070:  # the RAM chain holds at most 3070 samples: the rest is lost, like the firmware
+        del lines[len(lines) - (n - 3070):]; n = 3070
+    lines.append(f"# adc_end samples={n} wanted={wanted} chain=3070 invalid=0 period_cycles={per} first_cycles={-1000 * 240 + 77} slice_ms=50")
     return "\n".join(lines) + "\n"
 
 
@@ -344,5 +348,26 @@ p.stdout.readline()
 tools = [t["name"] for t in json.loads(p.stdout.readline())["result"]["tools"]]
 p.kill()
 check("MCP tools", set(tools) >= {"status", "capture", "levels", "channels", "test_generator", "device_log", "adc"}, tools)
+# combo-log: back-to-back combined captures until SIGTERM, epoch CSV, ADC rate lowered to fit the chain
+import os, signal as _sig
+combo = ROOT / "captures" / "test_combo.csv"
+cp = subprocess.Popen(["uv", "run", "-q", str(ROOT / "agent/analyzer.py"), "--host", host, "combo-log", "--pins", "IO10",
+                       "--adc-pin", "IO1", "--chunk-ms", "200", "--adc-rate", "20000", "--out", str(combo)],
+                      stdout=subprocess.PIPE, text=True)
+time.sleep(4); cp.send_signal(_sig.SIGTERM)
+cm = json.loads(cp.communicate(timeout=20)[0].strip().splitlines()[-1])
+check("combo-log: stops on SIGTERM with chunks", cp.returncode == 0 and cm["chunks"] >= 2, cm)
+check("combo-log: ADC rate lowered to fit the chain", cm["adc_rate_final"] == 13815 and cm["warnings"], cm)
+rows = combo.read_text().splitlines()
+check("combo-log: CSV header", rows[0] == "epoch_ms,signal,kind,value", rows[:2])
+d = analyzer.load_combo_csv(combo)
+check("combo-log: edges and ADC", len([e for e in d["dig"]["IO10"] if e[1] == "edge"]) == 3 * cm["chunks"]
+      and len(d["adc"]["IO1"][0]) == cm["adc_samples"], (cm, len(d["adc"].get("IO1", [[]])[0])))
+t = d["adc"]["IO1"][0]
+check("combo-log: epoch times", abs(t[0] / 1000 - time.time()) < 60 and t == sorted(t), t[:3])
+png = analyzer.plot_combo_png(combo, combo.with_suffix(".png"))
+check("combo-plot: PNG", png.exists() and png.stat().st_size > 10000)
+for x in (combo, combo.with_suffix(".png"), Path(str(combo) + ".meta.json")):
+    x.unlink()
 print("FAILURES:", fails)
 sys.exit(1 if fails else 0)

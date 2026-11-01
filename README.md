@@ -55,6 +55,8 @@ uv run agent/analyzer.py record --s 120 --pins IO10 --adc-pin IO1 --show
 uv run agent/analyzer.py live --pin IO1
 uv run agent/analyzer.py adc-log --adc-pin IO1 --out log.csv   # until Ctrl-C, epoch_ms,mv
 uv run agent/analyzer.py adc-plot log.csv
+uv run agent/analyzer.py combo-log --pins IO10 --adc-pin IO1 --out combo.csv   # digital + analog, same clock, until Ctrl-C
+uv run agent/analyzer.py combo-plot combo.csv --show
 uv run agent/analyzer.py selftest
 uv run agent/analyzer.py mcp
 ```

@@ -25,6 +25,9 @@ The ESP announces itself over mDNS as logic-s2.local (no fixed IP). Usage:
     uv run agent/analyzer.py live [--pin IO1] [--rate 5000] [--window-s 30]   # live voltage in a window
     uv run agent/analyzer.py adc-log --adc-pin IO1 --out x.csv [--chunk-ms 500] [--duration-s N]  # until SIGINT/SIGTERM, epoch_ms,mv
     uv run agent/analyzer.py adc-plot x.csv [-o x.png] [--show]                # voltage over time PNG from adc-log
+    uv run agent/analyzer.py combo-log --pins IO10 --adc-pin IO1 --out x.csv [--chunk-ms 500] [--adc-rate 2000]
+                                       [--duration-s N]   # digital + analog, same t0, until SIGINT/SIGTERM
+    uv run agent/analyzer.py combo-plot x.csv [-o x.png] [--t0 S --t1 S] [--show]   # analog + digital steps PNG
     uv run agent/analyzer.py analyze-adc captures/x_adc.csv                    # offline
     uv run agent/analyzer.py plot "file.csv|t0_ms|t1_ms|title" [...] [-o x.png] [--title T] [--show]  # PNG 9x9
     uv run agent/analyzer.py plot --auto file.csv [--show]                    # whole window + zoom on the first event
@@ -875,6 +878,175 @@ def plot_adc_epoch_png(csv_path: Path, out: Path, title: str = "") -> Path:
     return out
 
 
+def run_combo_log(an: "Analyzer", out_path: str, pins: str = "IO10", adc_pin: str = "IO1", chunk_ms: int = 500,
+                  adc_rate: int = 2000, adc_atten: str = "11", pull: str = "none", duration_s: float = 0,
+                  retry_s: float = 15.0, out=print):
+    """Digital pins + one analog pin on the same ESP time base, in back-to-back combined captures
+    (/capture with adc_pin), until SIGINT/SIGTERM (or duration_s). Long-format CSV flushed chunk by chunk:
+    `epoch_ms,signal,kind,value` with kind = init (level at chunk start), edge (new level) or mv (ADC sample).
+    The host time of the chunk's t0 = request start + half of the extra latency (same rule as adc-log).
+    The combined capture keeps the ADC samples in a small RAM chain (~1300 to 3000 samples): if a chunk comes
+    back short, adc_rate is lowered so chunk_ms fits. Chunks have a gap between them (request + transfer).
+    Metadata (chunks, gaps, coverage, startup) in <out>.meta.json."""
+    import signal
+
+    class _Stop(Exception):
+        pass
+
+    def _h(signum, frame):
+        raise _Stop()
+    signal.signal(signal.SIGINT, _h); signal.signal(signal.SIGTERM, _h)
+    out_p = Path(out_path); out_p.parent.mkdir(parents=True, exist_ok=True)
+    meta = {"format": "combo_epoch v1", "pins": pins, "adc_pin": adc_pin, "adc_rate_requested": adc_rate,
+            "chunk_ms": chunk_ms, "atten_db": adc_atten, "pull": pull, "t_start_epoch_ms": int(time.time() * 1000)}
+    lat, gaps, n_adc, n_edges, errors, warn = [], [], 0, 0, [], []
+    first, prev_end, fail_since, backoff, covered = None, None, None, 0.25, 0.0
+    f = out_p.open("w")
+    f.write("epoch_ms,signal,kind,value\n"); f.flush()
+    try:
+        t_end = time.time() + duration_s if duration_s else None
+        while t_end is None or time.time() < t_end:
+            ts = time.time() * 1000
+            try:
+                text = an.capture_csv(ms=chunk_ms, pins=pins, pull=pull, adc_pin=adc_pin, adc_rate=adc_rate,
+                                      adc_atten=adc_atten)
+                dig_t, adc_t = split_combined(text)
+                dig = parse_edges_csv(dig_t)
+                ad = parse_combined_adc(adc_t) if adc_t else {"mv": [], "cycles": [], "end": {}, "meta": {}}
+                if not dig["meta"]:
+                    raise AnalyzerError(f"unexpected answer: {text[:120]!r}")
+            except _Stop:
+                raise
+            except Exception as e:  # network hiccup or ESP busy: retry with growing backoff
+                if fail_since is None:
+                    fail_since = time.time(); backoff = 0.25
+                errors.append(f"{datetime.now():%H:%M:%S} {str(e)[:120]}")
+                if time.time() - fail_since > retry_s:
+                    meta["stopped_by"] = f"network: no answer for {retry_s:g} s"
+                    out(f"error: no answer from the ESP for {retry_s:g} s ({str(e)[:120]})")
+                    break
+                time.sleep(backoff); backoff = min(backoff * 2, 2.0)
+                an._ip = None  # resolve again over mDNS
+                continue
+            fail_since = None
+            tr = time.time() * 1000
+            extra = max(0.0, tr - ts - chunk_ms); lat.append(extra)
+            t0 = ts + extra / 2
+            hz = float(dig["meta"].get("cpu_hz", 240_000_000)) / 1000.0  # cycles per ms
+            if first is None:
+                first = t0; meta["first_sample_epoch_ms"] = round(t0, 1)
+                meta["startup_ms"] = round(t0 - meta["t_start_epoch_ms"], 1)
+                meta["adc_chain"] = ad["meta"].get("chain") or ad["end"].get("chain")
+                meta["adc_cal"] = ad["meta"].get("cal")
+            if prev_end is not None:
+                gaps.append(t0 - prev_end)
+            prev_end = t0 + chunk_ms; covered += chunk_ms
+            rows = [(t0, p, "init", v) for p, v in sorted(dig["initial"].items())]
+            rows += [(t0 + c / hz, p, "edge", v) for c, p, v in dig["rows"]]
+            rows += [(t0 + c / hz, adc_pin, "mv", v) for c, v in zip(ad["cycles"], ad["mv"])]
+            rows.sort(key=lambda r: r[0])
+            f.writelines(f"{t:.3f},{p},{k},{v}\n" for t, p, k, v in rows)
+            f.flush()
+            n_edges += len(dig["rows"]); n_adc += len(ad["mv"])
+            dend = dig["end"]
+            if dend.get("overflow", "0") not in ("0", "") or dend.get("status", "ok") not in ("ok", ""):
+                warn.append(f"chunk {len(lat)}: digital status={dend.get('status')} overflow={dend.get('overflow')}")
+            got, want = int(ad["end"].get("samples", 0) or 0), int(ad["end"].get("wanted", 0) or 0)
+            span = (ad["cycles"][-1] / hz) if ad["cycles"] else 0
+            if adc_t and (got < want or span < chunk_ms * 0.95):
+                chain = int(ad["end"].get("chain") or ad["meta"].get("chain") or got or 0)
+                new = max(611, int(chain * 0.9 * 1000 / chunk_ms)) if chain else 611
+                if new < adc_rate:
+                    warn.append(f"chunk {len(lat)}: ADC got {got}/{want} samples (chain {chain}): rate {adc_rate} -> {new}")
+                    adc_rate = new
+    except _Stop:
+        pass
+    finally:
+        signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        f.close()
+        t_stop = time.time() * 1000
+        span = (prev_end - first) if first is not None else 0
+        meta.update(t_stop_epoch_ms=int(t_stop), chunks=len(lat), edges=n_edges, adc_samples=n_adc,
+                    adc_rate_final=adc_rate,
+                    extra_latency_ms_median=round(sorted(lat)[len(lat) // 2], 1) if lat else None,
+                    gap_ms_median=round(sorted(gaps)[len(gaps) // 2], 1) if gaps else None,
+                    gap_ms_max=round(max(gaps), 1) if gaps else None,
+                    coverage_pct=round(100 * covered / span, 1) if span > 0 else None,
+                    warnings=warn[:10], net_errors=len(errors), net_error_samples=errors[:5])
+        Path(str(out_p) + ".meta.json").write_text(json.dumps(meta, indent=1))
+        out(json.dumps({"csv": str(out_p), **meta}, ensure_ascii=False))
+
+
+def load_combo_csv(csv_path: Path) -> dict:
+    """combo-log CSV -> {"adc": {pin: (t, mv)}, "dig": {pin: [(t, kind, level)]}}, times in epoch ms."""
+    adc, dig = {}, {}
+    for line in csv_path.read_text().splitlines()[1:]:
+        if not line or line[0] == "#":
+            continue
+        t, p, k, v = line.split(",")
+        if k == "mv":
+            a = adc.setdefault(p, ([], [])); a[0].append(float(t)); a[1].append(int(v))
+        else:
+            dig.setdefault(p, []).append((float(t), k, int(v)))
+    return {"adc": adc, "dig": dig}
+
+
+def plot_combo_png(csv_path: Path, out: Path, title: str = "", t0_s: float | None = None,
+                   t1_s: float | None = None) -> Path:
+    """combo-log PNG: analog trace on top, digital pins below as steps, same time axis; chunk gaps
+    (no data) show as breaks. t0_s/t1_s: window in seconds since the first sample."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    d = load_combo_csv(csv_path)
+    allt = [t for a in d["adc"].values() for t in a[0]] + [t for e in d["dig"].values() for t, _, _ in e]
+    if not allt:
+        raise AnalyzerError(f"{csv_path} has no samples")
+    base = min(allt)
+    lo = -1e18 if t0_s is None else t0_s
+    hi = 1e18 if t1_s is None else t1_s
+    npins = max(1, len(d["dig"]))
+    fig, axes = plt.subplots(1 + npins, 1, figsize=(11, 3.4 + 1.3 * npins), dpi=100, sharex=True,
+                             gridspec_kw={"height_ratios": [3] + [1] * npins})
+    ax = axes[0]
+    for p, (T, V) in d["adc"].items():
+        S = [(t - base) / 1000 for t in T]
+        dts = sorted(b - a for a, b in zip(S, S[1:]) if b > a)
+        brk = max(5 * dts[len(dts) // 2], 0.001) if dts else 0.05
+        xs, ys, last = [], [], None
+        for s, v in zip(S, V):
+            if lo <= s <= hi:
+                if last is not None and s - last > brk:  # gap between chunks: break the line
+                    xs.append(float("nan")); ys.append(float("nan"))
+                xs.append(s); ys.append(v); last = s
+        ax.plot(xs, ys, lw=0.7, color="#1f77b4", label=f"{p} (mV)")
+        if ys:
+            vv = [y for y in ys if y == y]
+            ax.set_title(title or f"{csv_path.name}: {p} min {min(vv)} / max {max(vv)} mV")
+    ax.axhline(2500, color="#d62728", lw=0.8, ls="--")
+    ax.set_ylim(-50, 2700); ax.set_ylabel("mV"); ax.grid(alpha=0.3); ax.legend(loc="upper right", fontsize=8)
+    for i, (p, ev) in enumerate(sorted(d["dig"].items())):
+        a = axes[1 + i]
+        xs, ys, last = [], [], None
+        for t, k, v in ev:
+            s = (t - base) / 1000
+            if not (lo <= s <= hi):
+                continue
+            if k == "init" and last is not None:  # new chunk: break the step line at the gap
+                xs.append(float("nan")); ys.append(float("nan"))
+            elif xs and ys[-1] == ys[-1]:
+                xs.append(s); ys.append(ys[-1])  # hold the previous level up to the edge
+            xs.append(s); ys.append(v); last = s
+        a.plot(xs, ys, lw=0.8, color="#2ca02c", drawstyle="default")
+        a.set_ylim(-0.2, 1.2); a.set_yticks([0, 1]); a.set_ylabel(p); a.grid(alpha=0.3)
+        n_e = sum(1 for _, k, _ in ev if k == "edge")
+        a.text(0.995, 0.85, f"{n_e} edges", transform=a.transAxes, ha="right", fontsize=8)
+    axes[-1].set_xlabel(f"time (s) since {datetime.fromtimestamp(base / 1000):%H:%M:%S}.{int(base % 1000):03d} "
+                        f"(epoch {base:.0f} ms)")
+    fig.tight_layout(); fig.savefig(out); plt.close(fig)
+    return out
+
+
 def _fw_tuple(v: str) -> tuple:
     return tuple(int(x) for x in re.findall(r"\d+", v or "0")[:3])
 
@@ -1389,6 +1561,14 @@ def main():
     p.add_argument("--retry-s", type=float, default=15.0, help="seconds of consecutive network failure before giving up")
     p = sub.add_parser("adc-plot"); p.add_argument("csv"); p.add_argument("-o", "--out"); p.add_argument("--title", default="")
     p.add_argument("--show", action="store_true")
+    p = sub.add_parser("combo-log"); p.add_argument("--pins", default="IO10"); p.add_argument("--adc-pin", default="IO1")
+    p.add_argument("--out", required=True); p.add_argument("--chunk-ms", type=int, default=500)
+    p.add_argument("--adc-rate", type=int, default=2000); p.add_argument("--adc-atten", default="11", choices=["0", "2.5", "6", "11"])
+    p.add_argument("--pull", default="none", choices=["none", "up", "down"]); p.add_argument("--duration-s", type=float, default=0)
+    p.add_argument("--retry-s", type=float, default=15.0, help="seconds of consecutive network failure before giving up")
+    p = sub.add_parser("combo-plot"); p.add_argument("csv"); p.add_argument("-o", "--out"); p.add_argument("--title", default="")
+    p.add_argument("--t0", type=float, help="window start, s since the first sample"); p.add_argument("--t1", type=float)
+    p.add_argument("--show", action="store_true")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
     p = sub.add_parser("presses"); p.add_argument("csv"); p.add_argument("--pin", default="IO10")
     p.add_argument("--silence-ms", type=float, default=20.0); p.add_argument("--ref", help="reference laps in ms, comma separated")
@@ -1462,6 +1642,17 @@ def main():
             if a.show:
                 show_png([png])
         return
+    if a.cmd == "combo-plot":
+        try:
+            src = Path(a.csv)
+            png = plot_combo_png(src, Path(a.out) if a.out else src.with_suffix(".png"), a.title, a.t0, a.t1)
+        except AnalyzerError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(2)
+        print(png)
+        if a.show:
+            show_png([png])
+        return
     if a.cmd == "analyze-adc":
         print(json.dumps(analyze_adc(parse_adc_csv(Path(a.csv).read_text())), indent=1))
         return
@@ -1505,6 +1696,9 @@ def main():
         elif a.cmd == "adc-log":
             run_adc_log(an, a.out, pin=a.adc_pin, chunk_ms=a.chunk_ms, rate=a.rate, atten=a.atten, duration_s=a.duration_s,
                         retry_s=a.retry_s)
+        elif a.cmd == "combo-log":
+            run_combo_log(an, a.out, pins=a.pins, adc_pin=a.adc_pin, chunk_ms=a.chunk_ms, adc_rate=a.adc_rate,
+                          adc_atten=a.adc_atten, pull=a.pull, duration_s=a.duration_s, retry_s=a.retry_s)
         elif a.cmd == "adc-plot":
             src = Path(a.csv); png = plot_adc_epoch_png(src, Path(a.out) if a.out else src.with_suffix(".png"), a.title)
             print(png)
