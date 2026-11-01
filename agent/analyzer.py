@@ -784,11 +784,12 @@ def run_live(an: "Analyzer", pin: str = "IO1", ms: int = 100, rate: int = 5000, 
 
 
 def run_adc_log(an: "Analyzer", out_path: str, pin: str = "IO1", chunk_ms: int = 500, rate: int = 1000,
-                atten: str = "11", duration_s: float = 0, out=print):
+                atten: str = "11", duration_s: float = 0, retry_s: float = 15.0, out=print):
     """Records the ADC in back-to-back chunks until SIGINT/SIGTERM (or duration_s) into an `epoch_ms,mv`
     CSV, flushed chunk by chunk. Each sample's time = host clock, estimated from the middle of the
     request's extra latency (uncertainty ~half of it). Metadata in <out>.meta.json. Chunks have a
-    gap between them (~370 ms)."""
+    gap between them (~370 ms). Network errors are retried with backoff (0.25 s doubling up to 2 s,
+    re-resolving mDNS) until retry_s seconds in a row without success."""
     import signal
 
     class _Stop(Exception):
@@ -800,15 +801,29 @@ def run_adc_log(an: "Analyzer", out_path: str, pin: str = "IO1", chunk_ms: int =
     out_p = Path(out_path); out_p.parent.mkdir(parents=True, exist_ok=True)
     meta = {"format": "adc_epoch v1", "pin": pin, "rate": rate, "chunk_ms": chunk_ms, "atten_db": atten,
             "t_start_epoch_ms": int(time.time() * 1000)}
-    lat, n, first = [], 0, None
+    lat, n, first, errors, fail_since, backoff = [], 0, None, [], None, 0.25
     f = out_p.open("w")
     f.write("epoch_ms,mv\n"); f.flush()
     try:
-        _ = an.ip
         t_end = time.time() + duration_s if duration_s else None
         while t_end is None or time.time() < t_end:
             ts = time.time() * 1000
-            d = parse_adc_csv(an.adc_csv(pin=pin, ms=chunk_ms, rate=rate, atten=atten))
+            try:
+                d = parse_adc_csv(an.adc_csv(pin=pin, ms=chunk_ms, rate=rate, atten=atten))
+            except _Stop:
+                raise
+            except Exception as e:  # network hiccup: retry with growing backoff
+                if fail_since is None:
+                    fail_since = time.time(); backoff = 0.25
+                errors.append(f"{datetime.now():%H:%M:%S} {str(e)[:120]}")
+                if time.time() - fail_since > retry_s:
+                    meta["stopped_by"] = f"network: no answer for {retry_s:g} s"
+                    out(f"error: no answer from the ESP for {retry_s:g} s ({str(e)[:120]})")
+                    break
+                time.sleep(backoff); backoff = min(backoff * 2, 2.0)
+                an._ip = None  # resolve again over mDNS
+                continue
+            fail_since = None
             tr = time.time() * 1000
             extra = max(0.0, tr - ts - chunk_ms); lat.append(extra)
             start = ts + extra / 2
@@ -824,7 +839,8 @@ def run_adc_log(an: "Analyzer", out_path: str, pin: str = "IO1", chunk_ms: int =
         signal.signal(signal.SIGINT, signal.SIG_IGN); signal.signal(signal.SIGTERM, signal.SIG_IGN)
         f.close()
         meta.update(t_stop_epoch_ms=int(time.time() * 1000), samples=n, chunks=len(lat),
-                    extra_latency_ms_median=round(sorted(lat)[len(lat) // 2], 1) if lat else None)
+                    extra_latency_ms_median=round(sorted(lat)[len(lat) // 2], 1) if lat else None,
+                    net_errors=len(errors), net_error_samples=errors[:5])
         Path(str(out_p) + ".meta.json").write_text(json.dumps(meta, indent=1))
         out(json.dumps({"csv": str(out_p), **meta}, ensure_ascii=False))
 
@@ -1370,6 +1386,7 @@ def main():
     p = sub.add_parser("adc-log"); p.add_argument("--adc-pin", default="IO1"); p.add_argument("--out", required=True)
     p.add_argument("--chunk-ms", type=int, default=500); p.add_argument("--rate", type=int, default=1000)
     p.add_argument("--atten", default="11", choices=["0", "2.5", "6", "11"]); p.add_argument("--duration-s", type=float, default=0)
+    p.add_argument("--retry-s", type=float, default=15.0, help="seconds of consecutive network failure before giving up")
     p = sub.add_parser("adc-plot"); p.add_argument("csv"); p.add_argument("-o", "--out"); p.add_argument("--title", default="")
     p.add_argument("--show", action="store_true")
     p = sub.add_parser("analyze-adc"); p.add_argument("csv")
@@ -1486,7 +1503,8 @@ def main():
                            out=lambda x: print(x, flush=True))
             sys.exit(0 if all(c.get("csv") for c in r["captures"]) else 1)
         elif a.cmd == "adc-log":
-            run_adc_log(an, a.out, pin=a.adc_pin, chunk_ms=a.chunk_ms, rate=a.rate, atten=a.atten, duration_s=a.duration_s)
+            run_adc_log(an, a.out, pin=a.adc_pin, chunk_ms=a.chunk_ms, rate=a.rate, atten=a.atten, duration_s=a.duration_s,
+                        retry_s=a.retry_s)
         elif a.cmd == "adc-plot":
             src = Path(a.csv); png = plot_adc_epoch_png(src, Path(a.out) if a.out else src.with_suffix(".png"), a.title)
             print(png)
