@@ -2,7 +2,7 @@
 
 A logic analyzer you reach over Wi-Fi, built on the Wi-Fi Devboard for Flipper Zero (ESP32-S2) running on its own, powered by a USB charger. It captures edges on 8 channels at about 0.1 us resolution, samples one analog channel at up to 83333 samples/s, and records for up to 280 s. A Python client turns each capture into a summary (bounce duration, pulse widths, frequency, duty) and a plot, from the command line or as an MCP server.
 
-We built it to measure button bounce on an STM32 NUCLEO board without leaving a USB port taken: after the first flash, every firmware update goes over the network.
+I built it to measure button bounce on an STM32 NUCLEO board without leaving a USB port taken: after the first flash, every firmware update goes over the network.
 
 ## Hardware
 
@@ -31,7 +31,7 @@ The 8 GPIOs form a dedicated GPIO bundle, so one `get_gpio_in` instruction reads
 
 The trade-off is Wi-Fi: while the loop runs, nothing else does, so `/capture` windows are capped at 2000 ms. The polling trigger waits in 100 ms slices and gives Wi-Fi a 1 ms break between them. An edge that lands in a break is still caught at the start of the next slice and reported as `status=trigger_in_gap`. If you need Wi-Fi alive while waiting, `tmode=isr` uses a GPIO interrupt instead. That costs 1 to 2 us of latency.
 
-`/record` takes the other side of that trade-off. The same polling loop runs in a low-priority task with interrupts enabled, so Wi-Fi and HTTP stay up for up to 280 s and 250k edges in PSRAM. Over 10 s idle we measured about 200 gaps over 100 us, about 5 over 1 ms and a maximum near 5 ms. The CSV reports these gaps, so you know when a short pulse may have been missed.
+`/record` takes the other side of that trade-off. The same polling loop runs in a low-priority task with interrupts enabled, so Wi-Fi and HTTP stay up for up to 280 s and 250k edges in PSRAM. Over 10 s idle I measured about 200 gaps over 100 us, about 5 over 1 ms and a maximum near 5 ms. The CSV reports these gaps, so you know when a short pulse may have been missed.
 
 The self-test drives a known bounce burst out of the RMT and a 10 kHz square wave out of the LEDC, then captures them on the same pins. On the board, the bounce widths came back within 0.09 us and the 10 kHz, 30% wave measured 9990 to 10010 Hz and 29.6 to 29.8%.
 
